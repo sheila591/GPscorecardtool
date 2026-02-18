@@ -22,6 +22,7 @@ input, textarea, select { font-family: 'DM Sans', sans-serif; }
 .tooltip { position: relative; cursor: help; }
 .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #1F2937; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 10; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .animate-in { animation: fadeIn 0.3s ease-out; }
 </style>
 </head>
@@ -669,8 +670,163 @@ function calculateScore(statuses, applicableCriteria) {
 }
 
 function generateId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
-function loadData() { try { return JSON.parse(localStorage.getItem("h3-audit-v3")) || { audits: [] }; } catch { return { audits: [] }; } }
-function saveData(data) { localStorage.setItem("h3-audit-v3", JSON.stringify(data)); }
+
+// ==========================================
+// DUAL-MODE STORAGE LAYER
+// ==========================================
+// Uses window.storage (Claude persistent API) when available,
+// falls back to localStorage otherwise.
+// JSON export/import for portability across any device.
+
+const STORAGE_INDEX_KEY = 'h3-audits-index';
+const AUDIT_KEY_PREFIX = 'h3-audit:';
+const BACKUP_TIMESTAMP_KEY = 'h3-audit-last-backup';
+
+const hasCloudStorage = () => {
+  try { return typeof window.storage !== 'undefined' && window.storage && typeof window.storage.get === 'function'; } catch { return false; }
+};
+
+// --- Cloud storage ops ---
+async function cloudGet(key) {
+  try { const r = await window.storage.get(key); return r ? r.value : null; } catch { return null; }
+}
+async function cloudSet(key, value) {
+  try { await window.storage.set(key, value); return true; } catch { return false; }
+}
+async function cloudDelete(key) {
+  try { await window.storage.delete(key); return true; } catch { return false; }
+}
+
+// --- Unified storage ops (cloud-first, localStorage fallback) ---
+async function storageGet(key) {
+  if (hasCloudStorage()) {
+    const v = await cloudGet(key);
+    if (v !== null) return v;
+  }
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+async function storageSet(key, value) {
+  let saved = false;
+  if (hasCloudStorage()) { saved = await cloudSet(key, value); }
+  try { localStorage.setItem(key, value); saved = true; } catch {}
+  return saved;
+}
+
+async function storageDelete(key) {
+  if (hasCloudStorage()) { await cloudDelete(key); }
+  try { localStorage.removeItem(key); } catch {}
+}
+
+// --- Audit CRUD ---
+async function loadAuditIndex() {
+  try {
+    const raw = await storageGet(STORAGE_INDEX_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+async function saveAuditIndex(index) {
+  await storageSet(STORAGE_INDEX_KEY, JSON.stringify(index));
+}
+
+async function loadAudit(auditId) {
+  try {
+    const raw = await storageGet(AUDIT_KEY_PREFIX + auditId);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function saveAudit(audit) {
+  await storageSet(AUDIT_KEY_PREFIX + audit.id, JSON.stringify(audit));
+}
+
+async function deleteAuditStorage(auditId) {
+  await storageDelete(AUDIT_KEY_PREFIX + auditId);
+}
+
+// --- Migration from old v3 localStorage format ---
+async function migrateFromOldFormat() {
+  try {
+    const old = localStorage.getItem('h3-audit-v3');
+    if (!old) return false;
+    const parsed = JSON.parse(old);
+    if (!parsed?.audits?.length) return false;
+    const existingIndex = await loadAuditIndex();
+    if (existingIndex.length > 0) { localStorage.removeItem('h3-audit-v3'); return false; }
+    const index = [];
+    for (const audit of parsed.audits) {
+      index.push({ id: audit.id, name: audit.name, createdAt: audit.createdAt, patientCount: (audit.patients || []).length });
+      await saveAudit(audit);
+    }
+    await saveAuditIndex(index);
+    localStorage.removeItem('h3-audit-v3');
+    return true;
+  } catch { return false; }
+}
+
+// --- Backup timestamp ---
+function getLastBackupTime() {
+  try { return localStorage.getItem(BACKUP_TIMESTAMP_KEY) || null; } catch { return null; }
+}
+function setLastBackupTime() {
+  try { localStorage.setItem(BACKUP_TIMESTAMP_KEY, new Date().toISOString()); } catch {}
+}
+
+// ==========================================
+// DATA PORTABILITY (JSON Export/Import)
+// ==========================================
+
+async function exportSingleAuditJSON(audit) {
+  const exportData = { _format: "h3-audit-export", _version: "3.2", _exportedAt: new Date().toISOString(), audit };
+  const json = JSON.stringify(exportData, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  const safeName = audit.name.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '_');
+  a.download = safeName + '_' + new Date().toISOString().slice(0,10) + '.h3audit.json';
+  a.click();
+  setLastBackupTime();
+}
+
+async function exportAllAuditsJSON(auditIndex) {
+  // Load full audit data for each
+  const fullAudits = [];
+  for (const entry of auditIndex) {
+    const audit = await loadAudit(entry.id);
+    if (audit) fullAudits.push(audit);
+  }
+  const exportData = { _format: "h3-audit-export-all", _version: "3.2", _exportedAt: new Date().toISOString(), _count: fullAudits.length, audits: fullAudits };
+  const json = JSON.stringify(exportData, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = 'H3_All_Audits_' + new Date().toISOString().slice(0,10) + '.h3audit.json';
+  a.click();
+  setLastBackupTime();
+}
+
+function parseImportFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data._format === "h3-audit-export" && data.audit) {
+          resolve({ type: "single", audits: [data.audit], exportedAt: data._exportedAt });
+        } else if (data._format === "h3-audit-export-all" && data.audits) {
+          resolve({ type: "bulk", audits: data.audits, exportedAt: data._exportedAt });
+        } else if (data.audits && Array.isArray(data.audits)) {
+          resolve({ type: "bulk", audits: data.audits, exportedAt: null });
+        } else {
+          reject(new Error("Unrecognized file format. Use an .h3audit.json file exported from this tool."));
+        }
+      } catch (err) { reject(new Error("Could not read file: " + err.message)); }
+    };
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsText(file);
+  });
+}
 
 function exportCSV(audit) {
   if (!audit?.patients?.length) return;
@@ -1322,7 +1478,10 @@ function Dashboard({ audit }) {
     <div className="animate-in">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
         <h2 style={{margin:0,fontSize:20,fontWeight:700,color:"#1a1a1a"}}>Audit Summary</h2>
-        <button onClick={()=>exportCSV(audit)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:13,cursor:"pointer"}}>📥 Export CSV</button>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>{exportSingleAuditJSON(audit);setLastBackupTime();}} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#0F766E",color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer"}}>💾 Save Audit File</button>
+          <button onClick={()=>exportCSV(audit)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:13,cursor:"pointer"}}>📥 Export CSV</button>
+        </div>
       </div>
 
       {stats.totalUnscored > 0 && (
@@ -1410,9 +1569,15 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
           <h1 style={{margin:0,fontSize:22,fontWeight:700,color:"#1a1a1a"}}>{audit.name}</h1>
           <span style={{fontSize:13,color:"#9CA3AF"}}>{audit.patients.length} patient{audit.patients.length!==1?"s":""}</span>
         </div>
-        <div style={{display:"flex",gap:4,background:"#F3F4F6",borderRadius:10,padding:3}}>
-          <button style={tabStyle(tab==="patients")} onClick={()=>{setTab("patients");setMode(null);}}>Patients</button>
-          <button style={tabStyle(tab==="dashboard")} onClick={()=>{setTab("dashboard");setMode(null);}}>Dashboard</button>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <button onClick={()=>{exportSingleAuditJSON(audit);setLastBackupTime();}} title="Save audit to file for use on another computer"
+            style={{padding:"6px 14px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#374151",fontWeight:600,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
+            💾 Save to File
+          </button>
+          <div style={{display:"flex",gap:4,background:"#F3F4F6",borderRadius:10,padding:3}}>
+            <button style={tabStyle(tab==="patients")} onClick={()=>{setTab("patients");setMode(null);}}>Patients</button>
+            <button style={tabStyle(tab==="dashboard")} onClick={()=>{setTab("dashboard");setMode(null);}}>Dashboard</button>
+          </div>
         </div>
       </div>
 
@@ -1474,18 +1639,91 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
   );
 }
 
+
 // Audit List
-function AuditListView({ audits, onSelect, onCreate, onDelete }) {
+function AuditListView({ audits, onSelect, onCreate, onDelete, onImport }) {
   const [name, setName] = useState("");
+  const [importDragOver, setImportDragOver] = useState(false);
+  const [importError, setImportError] = useState(null);
+  const [importPreview, setImportPreview] = useState(null);
+  const importRef = useRef();
+
+  const lastBackup = getLastBackupTime();
+  const daysSinceBackup = lastBackup ? Math.floor((Date.now() - new Date(lastBackup).getTime()) / 86400000) : null;
+  const showBackupReminder = audits.length > 0 && (daysSinceBackup === null || daysSinceBackup >= 3);
+
+  const handleImportFile = async (file) => {
+    if (!file) return;
+    setImportError(null);
+    try { const result = await parseImportFile(file); setImportPreview(result); }
+    catch (e) { setImportError(e.message); }
+  };
+
+  const confirmImport = () => {
+    if (!importPreview) return;
+    const existingIds = new Set(audits.map(a => a.id));
+    const newAudits = importPreview.audits.filter(a => !existingIds.has(a.id));
+    const dupeCount = importPreview.audits.length - newAudits.length;
+    onImport(newAudits);
+    setImportPreview(null);
+    if (dupeCount > 0) alert(newAudits.length + ' audit(s) imported, ' + dupeCount + ' duplicate(s) skipped.');
+  };
+
+  const storageMode = hasCloudStorage() ? 'cloud' : 'local';
+
   return (
     <div style={{maxWidth:640,margin:"0 auto"}}>
       <div style={{textAlign:"center",marginBottom:40}}>
         <div style={{fontSize:48,marginBottom:12}}>🩺</div>
         <h1 style={{fontSize:28,fontWeight:700,color:"#1a1a1a"}}>H3 Preventative Care Audit Tool</h1>
-        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Bulk upload Shepherd PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
-        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.1 — Bulk upload + improved scoring</div>
+        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Audit preventative care compliance against H3 standards.<br/>Save audit files to use across computers.</p>
+        <div style={{marginTop:8,display:"flex",gap:8,justifyContent:"center"}}>
+          <span style={{padding:"4px 12px",background:"#E0F2FE",borderRadius:20,fontSize:11,fontWeight:600,color:"#0369A1"}}>v3.2</span>
+          <span style={{padding:"4px 12px",background:storageMode==='cloud'?"#D1FAE5":"#FEF3C7",borderRadius:20,fontSize:11,fontWeight:600,color:storageMode==='cloud'?"#065F46":"#92400E"}}>
+            {storageMode==='cloud'?"☁️ Cloud sync active":"💻 Local storage — save files to share"}
+          </span>
+        </div>
       </div>
-      <Card style={{marginBottom:24}}>
+
+      {showBackupReminder && storageMode === 'local' && (
+        <div style={{marginBottom:16,padding:"14px 18px",background:"#FEF3C7",borderRadius:12,border:"1px solid #FCD34D",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:700,color:"#92400E"}}>💾 {daysSinceBackup===null ? "No backup saved yet" : "Last backup: " + daysSinceBackup + " day" + (daysSinceBackup!==1?"s":"") + " ago"}</div>
+            <div style={{fontSize:12,color:"#A16207",marginTop:2}}>Audits are stored in this browser only. Save a file to access on other computers.</div>
+          </div>
+          <button onClick={()=>exportAllAuditsJSON(audits)}
+            style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#92400E",color:"#fff",fontWeight:600,fontSize:12,cursor:"pointer",whiteSpace:"nowrap"}}>Save All</button>
+        </div>
+      )}
+
+      {importPreview && (
+        <Card style={{marginBottom:16,padding:20,background:"#F0FDFA",border:"1px solid #99F6E4"}}>
+          <h3 style={{margin:"0 0 12px 0",fontSize:15,fontWeight:700,color:"#0F766E"}}>📥 Import Preview</h3>
+          <div style={{fontSize:13,color:"#374151",marginBottom:4}}>
+            Found <strong>{importPreview.audits.length}</strong> audit{importPreview.audits.length!==1?'s':''}
+            {importPreview.exportedAt && <span style={{color:"#6B7280"}}> · exported {new Date(importPreview.exportedAt).toLocaleDateString()}</span>}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6,marginTop:8,marginBottom:16,maxHeight:200,overflowY:"auto"}}>
+            {importPreview.audits.map((a,i) => {
+              const isDupe = audits.some(ex => ex.id === a.id);
+              return (
+                <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,background:isDupe?"#FEF2F2":"#fff",border:isDupe?"1px solid #FECACA":"1px solid #E5E7EB"}}>
+                  <div><div style={{fontSize:13,fontWeight:600,color:isDupe?"#991B1B":"#1a1a1a"}}>{a.name}</div>
+                    <div style={{fontSize:11,color:"#9CA3AF"}}>{a.patients?.length||0} patient{(a.patients?.length||0)!==1?'s':''}</div></div>
+                  {isDupe && <span style={{fontSize:11,fontWeight:600,color:"#DC2626",padding:"2px 8px",background:"#FEE2E2",borderRadius:4}}>exists — skip</span>}
+                </div>);
+            })}
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+            <button onClick={()=>setImportPreview(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:13,cursor:"pointer"}}>Cancel</button>
+            <button onClick={confirmImport} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#0F766E",color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer"}}>
+              ✓ Import {importPreview.audits.filter(a => !audits.some(ex => ex.id === a.id)).length} Audit{importPreview.audits.filter(a => !audits.some(ex => ex.id === a.id)).length!==1?'s':''}
+            </button>
+          </div>
+        </Card>
+      )}
+
+      <Card style={{marginBottom:16}}>
         <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Create New Audit</h2>
         <div style={{display:"flex",gap:8}}>
           <input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g., February 2026 Audit"
@@ -1495,30 +1733,53 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
             style={{padding:"10px 20px",borderRadius:8,border:"none",cursor:name.trim()?"pointer":"default",background:name.trim()?"#0F766E":"#D1D5DB",color:"#fff",fontWeight:600,fontSize:14}}>+ New Audit</button>
         </div>
       </Card>
+
+      <Card style={{marginBottom:24}}>
+        <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 8px 0",color:"#374151"}}>Load Saved Audit</h2>
+        <div style={{fontSize:13,color:"#9CA3AF",marginBottom:12}}>Open an .h3audit.json file from another computer or session.</div>
+        <div className={"drop-zone"+(importDragOver?" dragover":"")} style={{padding:20}}
+          onDragOver={(e)=>{e.preventDefault();setImportDragOver(true);}} onDragLeave={()=>setImportDragOver(false)}
+          onDrop={(e)=>{e.preventDefault();setImportDragOver(false);handleImportFile(e.dataTransfer.files[0]);}}
+          onClick={()=>importRef.current?.click()}>
+          <input ref={importRef} type="file" accept=".json,.h3audit.json" style={{display:"none"}} onChange={(e)=>{handleImportFile(e.target.files[0]);e.target.value='';}}/>
+          <div style={{fontSize:24,marginBottom:6}}>📂</div>
+          <div style={{fontSize:14,fontWeight:600,color:"#374151"}}>Drop .h3audit.json file here, or click to browse</div>
+        </div>
+        {importError && <div style={{marginTop:8,padding:"8px 12px",background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,fontSize:12,color:"#991B1B"}}>⚠️ {importError}</div>}
+      </Card>
+
       {audits.length > 0 && (
-        <Card>
-          <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Your Audits</h2>
+        <Card style={{marginBottom:16}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <h2 style={{fontSize:16,fontWeight:600,margin:0,color:"#374151"}}>Your Audits ({audits.length})</h2>
+            <button onClick={()=>exportAllAuditsJSON(audits)} style={{padding:"6px 14px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#374151",fontWeight:600,fontSize:12,cursor:"pointer"}}>💾 Save All to File</button>
+          </div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {audits.map(a => (
               <div key={a.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",borderRadius:8,border:"1px solid #E5E7EB",cursor:"pointer",transition:"border-color 0.15s ease"}}
                 onMouseEnter={e=>e.currentTarget.style.borderColor="#0D9488"} onMouseLeave={e=>e.currentTarget.style.borderColor="#E5E7EB"}>
                 <div onClick={()=>onSelect(a.id)} style={{flex:1}}>
                   <div style={{fontWeight:600,color:"#1a1a1a",fontSize:15}}>{a.name}</div>
-                  <div style={{fontSize:12,color:"#9CA3AF",marginTop:2}}>{a.patients.length} patient{a.patients.length!==1?"s":""} · {new Date(a.createdAt).toLocaleDateString()}</div>
+                  <div style={{fontSize:12,color:"#9CA3AF",marginTop:2}}>{a.patientCount||0} patient{(a.patientCount||0)!==1?"s":""} · {new Date(a.createdAt).toLocaleDateString()}</div>
                 </div>
-                <button onClick={e=>{e.stopPropagation();onDelete(a.id);}} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:18}}>×</button>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <button onClick={async(e)=>{e.stopPropagation();const full=await loadAudit(a.id);if(full)exportSingleAuditJSON(full);}} title="Save this audit"
+                    style={{background:"none",border:"1px solid #E5E7EB",borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:12,color:"#6B7280",fontWeight:600}}>💾</button>
+                  <button onClick={e=>{e.stopPropagation();onDelete(a.id);}} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:18,padding:"0 4px"}}>×</button>
+                </div>
               </div>
             ))}
           </div>
         </Card>
       )}
-      <div style={{marginTop:32,padding:20,background:"#F0FDFA",borderRadius:12,border:"1px solid #99F6E4"}}>
-        <div style={{fontSize:13,color:"#0F766E",fontWeight:600,marginBottom:6}}>🔒 Privacy</div>
-        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>All PDF processing and data storage happens locally in your browser. Nothing is transmitted externally.</div>
-      </div>
-      <div style={{marginTop:12,padding:20,background:"#EFF6FF",borderRadius:12,border:"1px solid #BFDBFE"}}>
-        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.1)</div>
-        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>Bulk upload for multiple records at once with batch review. Unscored criteria count against compliance. Expanded Shepherd record pattern matching. Overdue reminder detection.</div>
+
+      <div style={{marginTop:16,padding:20,background:"#F0FDFA",borderRadius:12,border:"1px solid #99F6E4"}}>
+        <div style={{fontSize:13,color:"#0F766E",fontWeight:600,marginBottom:6}}>💾 How Saving Works</div>
+        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>
+          {storageMode==='cloud'
+            ? 'Your audits sync automatically across devices. Use "Save to File" as an extra backup or to share.'
+            : 'Audits are stored in this browser. Click "Save to File" to create a portable .h3audit.json you can email to yourself, save to a shared drive, or put on a USB — then load it on any computer.'}
+        </div>
       </div>
     </div>
   );
@@ -1526,14 +1787,96 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
 
 // Main App
 function App() {
-  const [data, setData] = useState(() => loadData());
+  const [auditIndex, setAuditIndex] = useState([]);
+  const [activeAudit, setActiveAudit] = useState(null);
   const [activeAuditId, setActiveAuditId] = useState(null);
-  const save = useCallback((d) => { setData(d); saveData(d); }, []);
-  const handleCreate = (name) => { const n={id:generateId(),name,createdAt:new Date().toISOString(),patients:[]}; save({...data,audits:[n,...data.audits]}); setActiveAuditId(n.id); };
-  const handleDelete = (id) => { if(!confirm("Delete this audit?")) return; save({...data,audits:data.audits.filter(a=>a.id!==id)}); if(activeAuditId===id) setActiveAuditId(null); };
-  const handleUpdate = (u) => { save({...data,audits:data.audits.map(a=>a.id===u.id?u:a)}); };
-  const active = data.audits.find(a=>a.id===activeAuditId);
-  return <div>{active ? <AuditWorkspace audit={active} onUpdate={handleUpdate} onBack={()=>setActiveAuditId(null)}/> : <AuditListView audits={data.audits} onSelect={setActiveAuditId} onCreate={handleCreate} onDelete={handleDelete}/>}</div>;
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [migrated, setMigrated] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const didMigrate = await migrateFromOldFormat();
+        if (didMigrate) setMigrated(true);
+        const index = await loadAuditIndex();
+        setAuditIndex(index);
+      } catch (e) { console.error('Load error:', e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!activeAuditId) { setActiveAudit(null); return; }
+    (async () => {
+      setLoading(true);
+      const audit = await loadAudit(activeAuditId);
+      if (audit) { setActiveAudit(audit); }
+      else { const ni = auditIndex.filter(a=>a.id!==activeAuditId); setAuditIndex(ni); await saveAuditIndex(ni); setActiveAuditId(null); }
+      setLoading(false);
+    })();
+  }, [activeAuditId]);
+
+  const handleCreate = async (name) => {
+    const id = generateId();
+    const audit = { id, name, createdAt: new Date().toISOString(), patients: [] };
+    const entry = { id, name, createdAt: audit.createdAt, patientCount: 0 };
+    const ni = [entry, ...auditIndex]; setAuditIndex(ni);
+    setSaving(true); await saveAuditIndex(ni); await saveAudit(audit); setSaving(false);
+    setActiveAuditId(id);
+  };
+
+  const handleDelete = async (id) => {
+    if (!confirm("Delete this audit? This is permanent.")) return;
+    const ni = auditIndex.filter(a=>a.id!==id); setAuditIndex(ni);
+    if (activeAuditId===id) { setActiveAuditId(null); setActiveAudit(null); }
+    setSaving(true); await saveAuditIndex(ni); await deleteAuditStorage(id); setSaving(false);
+  };
+
+  const handleUpdate = async (u) => {
+    setActiveAudit(u);
+    const ni = auditIndex.map(a=>a.id===u.id?{...a,name:u.name,patientCount:(u.patients||[]).length}:a);
+    setAuditIndex(ni);
+    setSaving(true); await saveAuditIndex(ni); await saveAudit(u); setSaving(false);
+  };
+
+  const handleImport = async (newAudits) => {
+    setSaving(true);
+    const entries = [];
+    for (const audit of newAudits) {
+      entries.push({ id: audit.id, name: audit.name, createdAt: audit.createdAt, patientCount: (audit.patients||[]).length });
+      await saveAudit(audit);
+    }
+    const ni = [...entries, ...auditIndex]; setAuditIndex(ni);
+    await saveAuditIndex(ni); setSaving(false);
+  };
+
+  if (loading) return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"60vh",gap:16}}>
+      <div style={{fontSize:48}}>🩺</div>
+      <div style={{fontSize:16,fontWeight:600,color:"#0F766E"}}>Loading audits...</div>
+    </div>
+  );
+
+  return (
+    <div>
+      {saving && (
+        <div style={{position:"fixed",top:12,right:24,padding:"6px 14px",borderRadius:20,background:"#0F766E",color:"#fff",fontSize:12,fontWeight:600,zIndex:100,display:"flex",alignItems:"center",gap:6,boxShadow:"0 2px 8px rgba(0,0,0,0.15)"}}>
+          <span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:"#A7F3D0"}}/>Saving...
+        </div>
+      )}
+      {migrated && (
+        <div style={{marginBottom:16,padding:"10px 16px",background:"#D1FAE5",border:"1px solid #A7F3D0",borderRadius:8,fontSize:13,color:"#065F46",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span>✅ Existing audits migrated to new storage format.</span>
+          <button onClick={()=>setMigrated(false)} style={{background:"none",border:"none",color:"#065F46",cursor:"pointer",fontSize:16}}>×</button>
+        </div>
+      )}
+      {activeAudit
+        ? <AuditWorkspace audit={activeAudit} onUpdate={handleUpdate} onBack={()=>setActiveAuditId(null)}/>
+        : <AuditListView audits={auditIndex} onSelect={setActiveAuditId} onCreate={handleCreate} onDelete={handleDelete} onImport={handleImport}/>
+      }
+    </div>
+  );
 }
 
 ReactDOM.render(<App/>, document.getElementById("root"));

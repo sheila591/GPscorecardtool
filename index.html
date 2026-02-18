@@ -18,6 +18,11 @@ button { font-family: 'DM Sans', sans-serif; }
 input, textarea, select { font-family: 'DM Sans', sans-serif; }
 .drop-zone { border: 2px dashed #CBD5E1; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; }
 .drop-zone:hover, .drop-zone.dragover { border-color: #0D9488; background: #F0FDFA; }
+.unscored-row { background: #FFFBEB !important; border-left: 3px solid #F59E0B !important; }
+.tooltip { position: relative; cursor: help; }
+.tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #1F2937; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 10; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.animate-in { animation: fadeIn 0.3s ease-out; }
 </style>
 </head>
 <body>
@@ -29,7 +34,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs
 
 const CRITERIA = [
   { id: "rabies", cat: "Vaccines", label: "Rabies vaccine status addressed", species: "both", note: "Dogs: 3-yr after initial | Cats: annual" },
-  { id: "dhpp", cat: "Vaccines", label: "DHPP vaccine status addressed", species: "canine", note: "Every 3 years after initial series" },
+  { id: "dhpp", cat: "Vaccines", label: "DHPP/DAPP vaccine status addressed", species: "canine", note: "Every 3 years after initial series" },
   { id: "fvrcp", cat: "Vaccines", label: "FVRCP vaccine status addressed", species: "feline", note: "Every 3 years after initial series" },
   { id: "lepto", cat: "Vaccines", label: "Leptospirosis vaccine addressed", species: "canine", note: "Annual" },
   { id: "bordetella", cat: "Vaccines", label: "Bordetella vaccine addressed", species: "canine", note: "Annual" },
@@ -66,7 +71,9 @@ const SCORE_LABELS = {
   needs_improvement: { label: "Needs Improvement", color: "#DC2626", bg: "#FEE2E2" },
 };
 
-// PDF Text Extraction
+// ==========================================
+// PDF TEXT EXTRACTION
+// ==========================================
 async function extractPDFText(file) {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -79,200 +86,541 @@ async function extractPDFText(file) {
   return fullText;
 }
 
-// Pattern Matching for Shepherd Records
+// ==========================================
+// IMPROVED PARSER FOR SHEPHERD RECORDS
+// ==========================================
 function parsePatientRecord(text) {
   const result = {
     demographics: { species: null, ageYears: 0, ageMonths: 0, sex: null, intact: null, code: '', dvm: '', visitType: 'wellness' },
     statuses: {},
     confidence: {},
     findings: [],
+    gaps: [],
     extractedText: text,
   };
 
-  // Species
-  if (/\b(canine|dog)\b/i.test(text)) { result.demographics.species = 'canine'; result.confidence.species = 'high'; }
-  else if (/\b(feline|cat|kitten)\b/i.test(text)) { result.demographics.species = 'feline'; result.confidence.species = 'high'; }
+  const t = text; // shorthand
+  const tLower = text.toLowerCase();
 
-  // Age
-  const ageMatch = text.match(/(\d{1,2})\s*(?:years?|yrs?|y)\s*(?:,?\s*(\d{1,2})\s*(?:months?|mos?|m))?/i);
-  if (ageMatch) {
-    result.demographics.ageYears = parseInt(ageMatch[1]) || 0;
-    if (ageMatch[2]) result.demographics.ageMonths = parseInt(ageMatch[2]) || 0;
-    result.confidence.age = 'medium';
+  // ---- SPECIES ----
+  if (/\bSpecies:\s*Canine\b/i.test(t) || /\b(canine|dog)\b/i.test(t)) {
+    result.demographics.species = 'canine'; result.confidence.species = 'high';
+  } else if (/\bSpecies:\s*Feline\b/i.test(t) || /\b(feline|cat|kitten)\b/i.test(t)) {
+    result.demographics.species = 'feline'; result.confidence.species = 'high';
   }
 
-  // Sex & Intact
-  if (/\b(fs|f\/s|female\s*spayed|spayed\s*female)\b/i.test(text)) {
+  // ---- AGE (from DOB if available) ----
+  const dobMatch = t.match(/DOB:\s*(\d{2})\/(\d{2})\/(\d{4})/i);
+  if (dobMatch) {
+    const dob = new Date(parseInt(dobMatch[3]), parseInt(dobMatch[1])-1, parseInt(dobMatch[2]));
+    const now = new Date();
+    let years = now.getFullYear() - dob.getFullYear();
+    let months = now.getMonth() - dob.getMonth();
+    if (months < 0) { years--; months += 12; }
+    result.demographics.ageYears = years;
+    result.demographics.ageMonths = months;
+    result.confidence.age = 'high';
+  } else {
+    // Fallback: text-based age
+    const ageMatch = t.match(/(\d{1,2})\s*[\-.]?\s*(?:years?|yrs?|y)[\s\-.,]*(?:old)?[,\s]*(?:(\d{1,2})\s*(?:months?|mos?|m))?/i);
+    if (ageMatch) {
+      result.demographics.ageYears = parseInt(ageMatch[1]) || 0;
+      if (ageMatch[2]) result.demographics.ageMonths = parseInt(ageMatch[2]) || 0;
+      result.confidence.age = 'medium';
+    }
+    // Also try "X-year-old" pattern
+    const ageMatch2 = t.match(/(\d+(?:\.\d+)?)\s*[\-]?\s*year[\-\s]*old/i);
+    if (ageMatch2 && !ageMatch) {
+      const ageFloat = parseFloat(ageMatch2[1]);
+      result.demographics.ageYears = Math.floor(ageFloat);
+      result.demographics.ageMonths = Math.round((ageFloat % 1) * 12);
+      result.confidence.age = 'medium';
+    }
+  }
+
+  // ---- SEX & INTACT ----
+  // Shepherd uses Sex: MN, FS, MI, FI in header
+  if (/\bSex:\s*FS\b/i.test(t) || /\b(fs|f\/s|female\s*spayed|spayed\s*female)\b/i.test(t)) {
     result.demographics.sex = 'female'; result.demographics.intact = false; result.confidence.sex = 'high';
-  } else if (/\b(mn|m\/n|male\s*neutered|neutered\s*male|castrated)\b/i.test(text)) {
+  } else if (/\bSex:\s*MN\b/i.test(t) || /\b(mn|m\/n|male\s*neutered|neutered\s*male|castrated)\b/i.test(t)) {
     result.demographics.sex = 'male'; result.demographics.intact = false; result.confidence.sex = 'high';
-  } else if (/\bintact\s*(male|female)\b/i.test(text)) {
-    const m = text.match(/\bintact\s*(male|female)\b/i);
-    result.demographics.sex = m[1].toLowerCase(); result.demographics.intact = true; result.confidence.sex = 'high';
+  } else if (/\bSex:\s*MI\b/i.test(t) || /\bintact\s*male\b/i.test(t)) {
+    result.demographics.sex = 'male'; result.demographics.intact = true; result.confidence.sex = 'high';
+  } else if (/\bSex:\s*FI\b/i.test(t) || /\bintact\s*female\b/i.test(t)) {
+    result.demographics.sex = 'female'; result.demographics.intact = true; result.confidence.sex = 'high';
   }
-  if (result.demographics.sex === null && /\bfemale\b/i.test(text)) { result.demographics.sex = 'female'; }
-  if (result.demographics.sex === null && /\bmale\b/i.test(text)) { result.demographics.sex = 'male'; }
-  if (result.demographics.intact === null && /\b(spayed|neutered|castrated|altered)\b/i.test(text)) { result.demographics.intact = false; }
-  if (result.demographics.intact === null && /\bintact\b/i.test(text)) { result.demographics.intact = true; }
+  if (result.demographics.sex === null && /\bfemale\b/i.test(t)) { result.demographics.sex = 'female'; }
+  if (result.demographics.sex === null && /\bmale\b/i.test(t)) { result.demographics.sex = 'male'; }
+  if (result.demographics.intact === null && /\b(spayed|neutered|castrated|altered)\b/i.test(t)) { result.demographics.intact = false; }
+  if (result.demographics.intact === null && /\bintact\b/i.test(t)) { result.demographics.intact = true; }
 
-  // DVM
-  const dvmMatch = text.match(/(?:dr\.?|doctor)\s+([A-Z][a-z]+)/i);
+  // ---- DVM ----
+  // Shepherd format: "Dr. FirstName LastName" or "Created by Dr. X"
+  const dvmMatch = t.match(/(?:Dr\.?\s+)([A-Z][a-z]+\s+[A-Z][a-z]+)/);
   if (dvmMatch) { result.demographics.dvm = 'Dr. ' + dvmMatch[1]; }
 
-  // Visit Type
-  if (/(?:sick|illness|emergency|vomit|diarrhea|lethargy|limp|cough)/i.test(text)) { result.demographics.visitType = 'sick'; }
-  else if (/(?:recheck|re-check|follow\s*up)/i.test(text)) { result.demographics.visitType = 'recheck'; }
-  else if (/(?:urgent|uc\s*exam)/i.test(text)) { result.demographics.visitType = 'urgent'; }
-
-  // --- VACCINES ---
-  if (/rabies\s*(?:vaccine|vacc|vx)/i.test(text) || /(?:administered|given).*rabies/i.test(text)) {
-    result.statuses.rabies = 'met'; result.confidence.rabies = 'high'; result.findings.push('Rabies vaccine found');
-  } else if (/rabies.*(?:due|overdue)/i.test(text)) {
-    result.statuses.rabies = 'not_met'; result.confidence.rabies = 'medium'; result.findings.push('Rabies due/overdue');
-  } else if (/rabies.*(?:decline|refused)/i.test(text)) {
-    result.statuses.rabies = 'declined'; result.confidence.rabies = 'high'; result.findings.push('Rabies declined');
-  }
-
-  if (/(?:dhpp|da2pp|dapp)/i.test(text)) {
-    if (/(?:administered|given|updated)/i.test(text)) { result.statuses.dhpp = 'met'; result.confidence.dhpp = 'high'; }
-    else { result.statuses.dhpp = 'met'; result.confidence.dhpp = 'medium'; }
-    result.findings.push('DHPP vaccine addressed');
-  }
-
-  if (/fvrcp/i.test(text)) {
-    result.statuses.fvrcp = 'met'; result.confidence.fvrcp = 'medium'; result.findings.push('FVRCP vaccine addressed');
-  }
-
-  if (/\blepto/i.test(text)) {
-    if (/lepto.*(?:administered|given|vaccine)/i.test(text) || /1\s*year\s*lepto/i.test(text)) {
-      result.statuses.lepto = 'met'; result.confidence.lepto = 'high'; result.findings.push('Lepto vaccine given');
-    } else if (/lepto.*(?:due|recommend)/i.test(text) || /due.*lepto/i.test(text)) {
-      result.statuses.lepto = 'partial'; result.confidence.lepto = 'medium'; result.findings.push('Lepto recommended');
-    } else if (/lepto.*decline/i.test(text)) {
-      result.statuses.lepto = 'declined'; result.confidence.lepto = 'high'; result.findings.push('Lepto declined');
+  // ---- VISIT TYPE ----
+  if (/\bsenior\s*wellness\b/i.test(t)) { result.demographics.visitType = 'wellness'; }
+  else if (/(?:sick|illness|emergency|vomit|diarrhea|lethargy|limp|cough)/i.test(t) && !/(?:look\s*out\s*for|monitor|contact.*if)/i.test(t)) {
+    // Only mark sick if the sick keywords are in the complaint, not in discharge instructions
+    const complaintSection = t.match(/(?:Initial Complaint|Presenting Complaint|History)[\s\S]{0,500}/i);
+    if (complaintSection && /(?:sick|illness|vomit|diarrhea|lethargy|limp|cough)/i.test(complaintSection[0])) {
+      result.demographics.visitType = 'sick';
     }
   }
+  else if (/(?:recheck|re-check|follow\s*up)/i.test(t)) { result.demographics.visitType = 'recheck'; }
+  else if (/(?:urgent|uc\s*exam)/i.test(t)) { result.demographics.visitType = 'urgent'; }
 
-  if (/bordetella/i.test(text)) {
-    if (/bordetella.*(?:administered|given|oral)/i.test(text)) {
-      result.statuses.bordetella = 'met'; result.confidence.bordetella = 'high'; result.findings.push('Bordetella given');
-    } else if (/bordetella.*(?:due|recommend)/i.test(text)) {
-      result.statuses.bordetella = 'partial'; result.confidence.bordetella = 'medium'; result.findings.push('Bordetella recommended');
-    } else if (/bordetella.*decline/i.test(text)) {
-      result.statuses.bordetella = 'declined'; result.confidence.bordetella = 'high'; result.findings.push('Bordetella declined');
+  // ---- PATIENT CODE ----
+  const pidMatch = t.match(/Patient\s*ID:\s*([A-Z0-9]+)/i);
+  if (pidMatch) { result.demographics.code = pidMatch[1]; }
+
+  // ==========================================
+  // VACCINE DETECTION
+  // ==========================================
+
+  // --- RABIES ---
+  // Check vaccine table first (most reliable)
+  const hasRabiesVaccGiven = /Rabies\s*Vaccination.*(?:Date\s*Given|Qty)/i.test(t) || /Rabies\s*Vaccination\s*-\s*(?:1|3)\s*year\s*-?\s*Qty/i.test(t);
+  const rabiesAdministered = /rabies.*(?:administered|given|SQ|IM)\b/i.test(t) || /(?:administered|given).*rabies/i.test(t);
+  const rabiesInServiceHistory = /Rabies\s*Vaccination\s*-\s*(?:1|3)\s*year\s*-\s*Qty:\s*1/i.test(t);
+
+  if (hasRabiesVaccGiven || rabiesAdministered || rabiesInServiceHistory) {
+    result.statuses.rabies = 'met'; result.confidence.rabies = 'high'; result.findings.push('Rabies vaccine administered');
+  } else if (/rabies.*(?:due|overdue|lapsed)/i.test(t)) {
+    // Check if it was addressed (offered/discussed) even if not given
+    if (/rabies.*(?:decline|refused|elected\s*not)/i.test(t)) {
+      result.statuses.rabies = 'declined'; result.confidence.rabies = 'high'; result.findings.push('Rabies discussed, client declined');
+    } else {
+      result.statuses.rabies = 'not_met'; result.confidence.rabies = 'medium'; result.findings.push('Rabies due/overdue, not addressed');
     }
+  } else if (/rabies.*current/i.test(t) || /rabies.*not\s*due/i.test(t)) {
+    result.statuses.rabies = 'na'; result.confidence.rabies = 'medium'; result.findings.push('Rabies current, not due');
   }
 
-  // Parasite Prevention
-  if (/(?:4dx|heartworm\s*test)/i.test(text)) {
-    if (/(?:negative|positive|performed|result)/i.test(text)) {
-      result.statuses.hw_test = 'met'; result.confidence.hw_test = 'high'; result.findings.push('HW test performed');
-    } else if (/(?:recommend|rec|due)/i.test(text)) {
-      result.statuses.hw_test = 'partial'; result.confidence.hw_test = 'medium'; result.findings.push('HW test recommended');
-    } else if (/decline/i.test(text)) {
-      result.statuses.hw_test = 'declined'; result.confidence.hw_test = 'high'; result.findings.push('HW test declined');
-    }
+  // --- DHPP/DAPP ---
+  const dappGiven = /(?:DAPP|DHPP|DA2PP|distemper\s*(?:\/\s*)?parvo).*(?:administered|given|SQ|Qty)/i.test(t) ||
+                     /(?:administered|given).*(?:DAPP|DHPP|DA2PP|distemper)/i.test(t) ||
+                     /(?:DAPP|DA2PP)\s*(?:3\s*year|\d\s*year|[\+])\s*.*Qty:\s*1/i.test(t);
+  const dappInVaccTable = /(?:DAPP|DA2PP|DHPP)\s*(?:3\s*year|\+\s*L|\-\s*\d)/i.test(t);
+
+  if (dappGiven || dappInVaccTable) {
+    result.statuses.dhpp = 'met'; result.confidence.dhpp = 'high'; result.findings.push('DHPP/DAPP vaccine addressed');
+  } else if (/(?:DAPP|DHPP|DA2PP|distemper).*(?:decline|refused)/i.test(t)) {
+    result.statuses.dhpp = 'declined'; result.confidence.dhpp = 'high'; result.findings.push('DHPP/DAPP declined');
+  } else if (/(?:DAPP|DHPP|DA2PP|distemper).*(?:due|overdue|recommend)/i.test(t)) {
+    result.statuses.dhpp = 'partial'; result.confidence.dhpp = 'medium'; result.findings.push('DHPP/DAPP recommended');
   }
 
-  if (/(?:simparica|revolution\s*plus|bravecto)/i.test(text)) {
-    if (/(?:dispensed|started|prescribed|administered|purchased|continued)/i.test(text)) {
-      result.statuses.parasite_prev = 'met'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention dispensed');
-    } else if (/(?:recommend|discuss)/i.test(text)) {
-      result.statuses.parasite_prev = 'partial'; result.confidence.parasite_prev = 'medium'; result.findings.push('Parasite prevention discussed');
-    } else if (/decline/i.test(text)) {
-      result.statuses.parasite_prev = 'declined'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention declined');
-    }
-  } else if (/(?:discussed?\s*hw|parasite\s*prevent)/i.test(text)) {
+  // --- FVRCP ---
+  if (/fvrcp.*(?:administered|given|SQ|Qty)/i.test(t) || /(?:administered|given).*fvrcp/i.test(t)) {
+    result.statuses.fvrcp = 'met'; result.confidence.fvrcp = 'high'; result.findings.push('FVRCP vaccine administered');
+  } else if (/fvrcp.*(?:decline|refused)/i.test(t)) {
+    result.statuses.fvrcp = 'declined'; result.confidence.fvrcp = 'high'; result.findings.push('FVRCP declined');
+  } else if (/fvrcp/i.test(t)) {
+    result.statuses.fvrcp = 'met'; result.confidence.fvrcp = 'medium'; result.findings.push('FVRCP addressed');
+  }
+
+  // --- LEPTOSPIROSIS ---
+  const leptoGiven = /lepto.*(?:administered|given|SQ|vaccine.*Qty)/i.test(t) ||
+                     /(?:administered|given).*lepto/i.test(t) ||
+                     /Lepto\s*4\s*Vaccine.*Qty:\s*1/i.test(t) ||
+                     /(?:DAPP|DA2PP)\s*.*\+\s*L(?:epto)?\s*.*(?:given|SQ|administered|Qty)/i.test(t) ||
+                     /\+\s*L\s*1\s*year.*Qty/i.test(t);
+  const leptoDeclined = /lepto.*(?:decline|refused|elected\s*not)/i.test(t) || /(?:decline|refused).*lepto/i.test(t);
+  const leptoDiscussed = /lepto.*(?:recommend|discuss|offered|due)/i.test(t) || /(?:offered|recommend|discuss).*lepto/i.test(t);
+  const leptoOverdue = /Lepto.*(?:Vaccine|1\s*year).*(?:overdue|due)/i.test(t);
+  // Check reminders section for overdue lepto
+  const leptoReminderOverdue = /Lepto\s*(?:Vaccine\s*-?\s*1\s*year|1\s*year\s*\(Reminder\)).*?\d{2}\/\d{2}\/\d{4}/gi;
+
+  if (leptoGiven) {
+    result.statuses.lepto = 'met'; result.confidence.lepto = 'high'; result.findings.push('Lepto vaccine administered');
+  } else if (leptoDeclined) {
+    result.statuses.lepto = 'declined'; result.confidence.lepto = 'high'; result.findings.push('Lepto discussed, client declined');
+  } else if (leptoDiscussed) {
+    result.statuses.lepto = 'partial'; result.confidence.lepto = 'medium'; result.findings.push('Lepto discussed/recommended');
+  }
+
+  // --- BORDETELLA ---
+  const bordGiven = /bordetella.*(?:administered|given|oral|SQ|IM|Qty)/i.test(t) ||
+                    /(?:administered|given).*bordetella/i.test(t) ||
+                    /Bordetella\s*Oral\s*-?\s*Qty:\s*1/i.test(t);
+  const bordDeclined = /bordetella.*(?:decline|refused|elected\s*not)/i.test(t) || /(?:decline|refused).*bordetella/i.test(t);
+  const bordNotRecommended = /bordetella.*(?:not\s*recommend)/i.test(t);
+  const bordDiscussed = /bordetella.*(?:recommend|discuss|offered|due)/i.test(t) || /(?:discussed|offered).*bordetella/i.test(t);
+
+  if (bordGiven) {
+    result.statuses.bordetella = 'met'; result.confidence.bordetella = 'high'; result.findings.push('Bordetella administered');
+  } else if (bordDeclined) {
+    result.statuses.bordetella = 'declined'; result.confidence.bordetella = 'high'; result.findings.push('Bordetella discussed, client declined');
+  } else if (bordNotRecommended) {
+    // DVM assessed lifestyle and determined not needed - this counts as "addressed"
+    result.statuses.bordetella = 'met'; result.confidence.bordetella = 'high'; result.findings.push('Bordetella assessed - not recommended based on lifestyle');
+  } else if (bordDiscussed) {
+    result.statuses.bordetella = 'partial'; result.confidence.bordetella = 'medium'; result.findings.push('Bordetella discussed');
+  }
+
+  // ==========================================
+  // PARASITE PREVENTION
+  // ==========================================
+
+  // --- HEARTWORM TEST ---
+  // Shepherd abbreviations: HWT, 4DX, IH 4DX, heartworm test
+  const hwTestPerformed = /(?:4dx|heartworm\s*test|hw\s*test|hwt|snap\s*4dx).*(?:negative|positive|performed|result|normal)/i.test(t) ||
+                          /(?:negative|positive|performed|result).*(?:4dx|heartworm\s*test|hwt)/i.test(t) ||
+                          /IH\s*4DX/i.test(t) ||
+                          /(?:venipuncture|blood\s*draw).*(?:4DX|HWT)/i.test(t) ||
+                          /4DX.*(?:submitted|sent|drawn)/i.test(t);
+  const hwTestRecommended = /(?:4dx|heartworm\s*test|hw\s*test|hwt|HWT).*(?:recommend|rec|due|offered|est\b)/i.test(t) ||
+                            /(?:recommend|offered|est\s*for).*(?:4dx|heartworm|hwt|HWT)/i.test(t) ||
+                            /Est\s*(?:for|:).*(?:HWT|heartworm|4dx)/i.test(t) ||
+                            /annual\s*heartworm\s*test\s*recommend/i.test(t);
+  const hwTestDeclined = /(?:4dx|heartworm\s*test|hwt).*(?:decline|refused)/i.test(t) || /(?:decline|refused).*(?:4dx|heartworm|hwt)/i.test(t);
+  // Check HW Test reminder status (overdue = red in Shepherd)
+  const hwTestOverdueReminder = /Heartworm\s*Test.*\d{2}\/\d{2}\/202[0-5]/i.test(t);
+
+  if (hwTestPerformed) {
+    result.statuses.hw_test = 'met'; result.confidence.hw_test = 'high'; result.findings.push('Heartworm test performed');
+  } else if (hwTestDeclined) {
+    result.statuses.hw_test = 'declined'; result.confidence.hw_test = 'high'; result.findings.push('HW test discussed, client declined');
+  } else if (hwTestRecommended) {
+    result.statuses.hw_test = 'partial'; result.confidence.hw_test = 'medium'; result.findings.push('HW test recommended but not performed');
+  }
+  // Note: if nothing detected, it stays unset — scoring will flag it
+
+  // --- PARASITE PREVENTION ---
+  const ppProducts = /(?:simparica\s*trio|revolution\s*plus|bravecto\s*plus|nexgard|heartgard|interceptor|sentinel|credelio|advantage\s*multi)/i;
+  const ppDispensed = new RegExp(ppProducts.source + '.*(?:dispensed|started|prescribed|administered|purchased|continued|supply|dose|Qty|Rx)', 'i').test(t) ||
+                      new RegExp('(?:dispensed|started|prescribed|administered|purchased).*' + ppProducts.source, 'i').test(t) ||
+                      /Simparica\s*Trio.*(?:single\s*dose|6[\s-]*(?:month|mo|pk)|12[\s-]*(?:month|mo))/i.test(t);
+  const ppDeclined = /(?:simparica|revolution|bravecto|parasite\s*prev|flea.*tick.*prev|heartworm\s*prev).*(?:decline|refused|elected.*(?:not|hold\s*off))/i.test(t) ||
+                     /(?:decline|refused|hold\s*off|elected\s*not).*(?:simparica|revolution|bravecto|parasite|prevention)/i.test(t) ||
+                     /Client\s*(?:declined|elected\s*to\s*hold\s*off).*(?:prevention|simparica|parasite)/i.test(t);
+  const ppDiscussed = /(?:simparica|revolution|bravecto|parasite\s*prev|flea.*tick|heartworm\s*prev).*(?:recommend|discuss|offered|information)/i.test(t) ||
+                      /(?:recommend|discuss|offered).*(?:simparica|revolution|bravecto|parasite|flea.*tick)/i.test(t) ||
+                      /(?:flea|tick|heartworm).*(?:prevention|preventative|prev)\b/i.test(t);
+
+  if (ppDispensed) {
+    result.statuses.parasite_prev = 'met'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention dispensed/prescribed');
+  } else if (ppDeclined) {
+    // Check if it was also discussed (partial credit for discussing even if declined)
+    result.statuses.parasite_prev = 'declined'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention discussed, client declined');
+  } else if (ppDiscussed) {
     result.statuses.parasite_prev = 'partial'; result.confidence.parasite_prev = 'medium'; result.findings.push('Parasite prevention discussed');
   }
 
-  // FeLV/FIV
-  if (/(?:felv|fiv).*(?:test|combo|snap)/i.test(text)) {
-    if (/(?:negative|positive|performed)/i.test(text)) {
+  // ==========================================
+  // DIAGNOSTICS
+  // ==========================================
+
+  // --- FeLV/FIV ---
+  if (/(?:felv|fiv).*(?:test|combo|snap)/i.test(t)) {
+    if (/(?:negative|positive|performed|result)/i.test(t)) {
       result.statuses.felv_fiv = 'met'; result.confidence.felv_fiv = 'high'; result.findings.push('FeLV/FIV test performed');
-    } else {
-      result.statuses.felv_fiv = 'partial'; result.confidence.felv_fiv = 'medium'; result.findings.push('FeLV/FIV testing mentioned');
+    } else { result.statuses.felv_fiv = 'partial'; result.confidence.felv_fiv = 'medium'; result.findings.push('FeLV/FIV testing mentioned'); }
+  }
+
+  // --- WELLNESS BLOODWORK ---
+  // Shepherd abbreviations: bw, BW, bloodwork, blood panel, CBC, chemistry, comprehensive panel
+  const bwPerformed = /(?:bloodwork|blood\s*work|blood\s*panel|cbc|chemistry|comprehensive\s*panel|wellness\s*panel|bw)\b.*(?:performed|ran|completed|result|normal|wnl|submitted|sent)/i.test(t) ||
+                      /(?:performed|ran|completed|result|normal).*(?:bloodwork|blood\s*panel|cbc|chemistry|bw)\b/i.test(t);
+  const bwRecommended = /(?:bloodwork|blood\s*work|blood\s*panel|cbc|bw|annual\s*bw|wellness\s*bw)\b.*(?:recommend|offered|discussed|due|est\b)/i.test(t) ||
+                        /(?:recommend|offered|est\s*for).*(?:bloodwork|blood\s*panel|bw|blood\s*work)\b/i.test(t) ||
+                        /Est\s*(?:for|:).*\bbw\b/i.test(t) ||
+                        /annual\s*bloodwork/i.test(t) ||
+                        /(?:offered|client\s*was\s*offered)[\s\S]{0,200}(?:bloodwork|blood\s*panel|bw)\b/i.test(t);
+  const bwDeclined = /(?:bloodwork|blood\s*work|blood\s*panel|bw|annual\s*bloodwork)\b.*(?:decline|refused)/i.test(t) ||
+                     /(?:decline|refused).*(?:bloodwork|blood\s*panel|bw|annual\s*bloodwork)\b/i.test(t) ||
+                     /Client\s*(?:Declined|declined)[\s\S]{0,200}(?:bloodwork|blood\s*panel|bw)\b/i.test(t);
+
+  if (bwPerformed) {
+    result.statuses.wellness_bw = 'met'; result.confidence.wellness_bw = 'high'; result.findings.push('Bloodwork performed');
+  } else if (bwDeclined) {
+    result.statuses.wellness_bw = 'declined'; result.confidence.wellness_bw = 'high'; result.findings.push('Bloodwork offered, client declined');
+  } else if (bwRecommended) {
+    result.statuses.wellness_bw = 'partial'; result.confidence.wellness_bw = 'medium'; result.findings.push('Bloodwork recommended/offered');
+  }
+
+  // --- SENIOR BLOODWORK (7+) ---
+  const isSenior = (result.demographics.ageYears || 0) >= 7;
+  if (isSenior) {
+    const seniorBWPerformed = /(?:senior\s*(?:blood|panel|bw)|comprehensive\s*panel).*(?:performed|completed|result|normal)/i.test(t);
+    const seniorBWRecommended = /(?:senior\s*(?:blood|panel|bw)).*(?:recommend|offered|discussed|due)/i.test(t) ||
+                                /(?:offered|recommend).*(?:senior\s*(?:blood|panel|bw))/i.test(t) ||
+                                /senior\s*bloodwork/i.test(t);
+    const seniorBWDeclined = /(?:senior\s*(?:blood|panel|bw)).*(?:decline|refused)/i.test(t) ||
+                             /(?:decline|refused).*(?:senior\s*(?:blood|panel|bw))/i.test(t);
+
+    if (seniorBWPerformed) {
+      result.statuses.senior_bw = 'met'; result.confidence.senior_bw = 'high'; result.findings.push('Senior bloodwork performed');
+    } else if (seniorBWDeclined) {
+      result.statuses.senior_bw = 'declined'; result.confidence.senior_bw = 'high'; result.findings.push('Senior bloodwork offered, declined');
+    } else if (seniorBWRecommended) {
+      result.statuses.senior_bw = 'partial'; result.confidence.senior_bw = 'medium'; result.findings.push('Senior bloodwork recommended');
+    }
+    // If general bloodwork was offered/declined and no specific senior BW, bridge it
+    if (!result.statuses.senior_bw && result.statuses.wellness_bw) {
+      if (result.statuses.wellness_bw === 'declined') {
+        result.statuses.senior_bw = 'declined'; result.confidence.senior_bw = 'low';
+        result.findings.push('Senior BW inferred from general bloodwork declined');
+      } else if (result.statuses.wellness_bw === 'met') {
+        result.statuses.senior_bw = 'met'; result.confidence.senior_bw = 'low';
+        result.findings.push('Senior BW inferred from general bloodwork performed');
+      }
     }
   }
 
-  // Bloodwork
-  if (/(?:bloodwork|blood\s*panel|cbc|chemistry)/i.test(text)) {
-    if (/(?:performed|ran|completed|result|normal|wnl)/i.test(text)) {
-      result.statuses.wellness_bw = 'met'; result.confidence.wellness_bw = 'high'; result.findings.push('Bloodwork performed');
-    } else if (/(?:recommend|discuss|due)/i.test(text)) {
-      result.statuses.wellness_bw = 'partial'; result.confidence.wellness_bw = 'medium'; result.findings.push('Bloodwork recommended');
-    } else if (/decline/i.test(text)) {
-      result.statuses.wellness_bw = 'declined'; result.confidence.wellness_bw = 'high'; result.findings.push('Bloodwork declined');
-    }
+  // --- FECAL ---
+  const fecalPerformed = /\bfecal\b.*(?:performed|negative|positive|result|submitted|sent|normal|wnl)/i.test(t) ||
+                         /(?:performed|submitted|sent).*\bfecal\b/i.test(t);
+  const fecalRecommended = /\bfecal\b.*(?:recommend|offered|due|est\b)/i.test(t) ||
+                           /(?:recommend|offered|est\s*for).*\bfecal\b/i.test(t) ||
+                           /Est\s*(?:for|:).*fecal/i.test(t);
+  const fecalDeclined = /\bfecal\b.*(?:decline|refused)/i.test(t) || /(?:decline|refused).*\bfecal\b/i.test(t);
+
+  if (fecalPerformed) {
+    result.statuses.fecal = 'met'; result.confidence.fecal = 'high'; result.findings.push('Fecal exam performed');
+  } else if (fecalDeclined) {
+    result.statuses.fecal = 'declined'; result.confidence.fecal = 'high'; result.findings.push('Fecal exam offered, declined');
+  } else if (fecalRecommended) {
+    result.statuses.fecal = 'partial'; result.confidence.fecal = 'medium'; result.findings.push('Fecal exam recommended');
   }
 
-  // Fecal
-  if (/\bfecal\b/i.test(text)) {
-    if (/fecal.*(?:performed|negative|positive|result|submitted)/i.test(text)) {
-      result.statuses.fecal = 'met'; result.confidence.fecal = 'high'; result.findings.push('Fecal performed');
-    } else if (/fecal.*(?:recommend|due)/i.test(text)) {
-      result.statuses.fecal = 'partial'; result.confidence.fecal = 'medium'; result.findings.push('Fecal recommended');
-    } else if (/fecal.*decline/i.test(text)) {
-      result.statuses.fecal = 'declined'; result.confidence.fecal = 'high'; result.findings.push('Fecal declined');
-    }
+  // ==========================================
+  // DENTAL
+  // ==========================================
+
+  // --- DENTAL GRADE ---
+  // Shepherd formats: "grade 2", "Grade 2/4", "cat 1", "AVDC stage 1", "periodontal disease cat 1"
+  let dentalGradeValue = null;
+  const gradePatterns = [
+    /(?:grade|gr)\.?\s*(\d)\s*(?:\/\s*4)?/i,
+    /(?:periodontal\s*disease|dental)\s*(?:cat(?:egory)?|stage|grade)\s*(\d)/i,
+    /AVDC\s*(?:stage|grade)\s*(\d)/i,
+    /(?:cat(?:egory)?|stage)\s*(\d)\s*(?:\/\s*4)?(?:\s*(?:dental|periodontal))?/i,
+  ];
+  for (const p of gradePatterns) {
+    const m = t.match(p);
+    if (m) { dentalGradeValue = parseInt(m[1]); break; }
   }
 
-  // Dental Grade
-  const gradeMatch = text.match(/(?:grade|gr)\.?\s*(\d)\s*(?:\/\s*4)?/i);
-  if (gradeMatch) {
+  if (dentalGradeValue !== null) {
     result.statuses.dental_grade = 'met'; result.confidence.dental_grade = 'high';
-    result.findings.push('Dental grade ' + gradeMatch[1] + ' documented');
-    if (parseInt(gradeMatch[1]) >= 2) {
-      if (/(?:dental|cleaning).*estimate/i.test(text)) {
+    result.findings.push('Dental grade ' + dentalGradeValue + ' documented');
+
+    // Dental estimate needed for grade 2+
+    if (dentalGradeValue >= 2) {
+      const dentalEstCreated = /(?:dental|cleaning|prophy).*(?:estimate|est\b)/i.test(t) ||
+                               /(?:estimate|est\b).*(?:dental|cleaning|prophy)/i.test(t);
+      const dentalEstDeclined = /(?:dental|cleaning).*(?:estimate|est).*(?:decline|refused)/i.test(t);
+      if (dentalEstCreated) {
         result.statuses.dental_est = 'met'; result.confidence.dental_est = 'high'; result.findings.push('Dental estimate created');
+      } else if (dentalEstDeclined) {
+        result.statuses.dental_est = 'declined'; result.confidence.dental_est = 'high'; result.findings.push('Dental estimate declined');
       } else {
-        result.statuses.dental_est = 'not_met'; result.confidence.dental_est = 'medium'; result.findings.push('Grade 2+ but no dental estimate found');
+        result.statuses.dental_est = 'not_met'; result.confidence.dental_est = 'medium'; result.findings.push('Grade ' + dentalGradeValue + ' but no dental estimate found');
+        result.gaps.push('Dental grade ' + dentalGradeValue + ': estimate should be created');
       }
     } else {
-      result.statuses.dental_est = 'na';
+      result.statuses.dental_est = 'na'; result.confidence.dental_est = 'high';
+    }
+  } else {
+    // Check for descriptive dental findings without numeric grade
+    const hasDentalFindings = /(?:tartar|calculus|gingivitis|periodontal|plaque|dental\s*disease)/i.test(t);
+    const hasOralExam = /(?:oral\s*(?:cavity|exam)|dentition|teeth)/i.test(t);
+    if (hasDentalFindings && !dentalGradeValue) {
+      result.statuses.dental_grade = 'partial'; result.confidence.dental_grade = 'medium';
+      result.findings.push('Dental findings noted but no numeric grade (1-4) documented');
+      result.gaps.push('Dental findings present but missing standardized grade (1-4 scale)');
+    } else if (hasOralExam && /(?:clean|normal|healthy|no\s*(?:gingivitis|tartar|calculus))/i.test(t)) {
+      // Clean teeth noted but no formal grade
+      result.statuses.dental_grade = 'partial'; result.confidence.dental_grade = 'low';
+      result.findings.push('Oral exam noted clean/normal but no numeric grade documented');
+      result.gaps.push('Oral exam performed but missing 1-4 grade documentation');
     }
   }
 
-  // Home dental care
-  if (/(?:oravet|dental\s*(?:chew|care|brushing)|cet|vohc)/i.test(text)) {
-    result.statuses.dental_home = 'met'; result.confidence.dental_home = 'high'; result.findings.push('Home dental care discussed');
+  // --- HOME DENTAL CARE ---
+  const homeDentalDiscussed = /(?:oravet|dental\s*(?:chew|care|diet)|cet\b|vohc|brushing|brush(?:es|ed)?|scaling|scale(?:s|d)?(?:\s*teeth)?|dental\s*home|home\s*dental)/i.test(t) ||
+                              /(?:o\s*brushes|owner\s*brushes|client\s*brushes)/i.test(t);
+
+  if (homeDentalDiscussed) {
+    result.statuses.dental_home = 'met'; result.confidence.dental_home = 'high'; result.findings.push('Home dental care discussed/documented');
   }
 
-  // BCS
-  const bcsMatch = text.match(/(?:bcs|body\s*condition).*?(\d)\s*(?:\/\s*9)?/i);
-  if (bcsMatch) {
+  // ==========================================
+  // NUTRITION
+  // ==========================================
+
+  // --- BCS ---
+  let bcsValue = null;
+  const bcsPatterns = [
+    /(?:bcs|body\s*condition(?:\s*score)?)\s*[:=]?\s*(\d)\s*(?:\/\s*9)?/i,
+    /\bBcs\s*\n?\s*(\d)\s*\/\s*9/i,
+    /(\d)\s*\/\s*9\s*(?:bcs|body\s*condition|ideal|overweight|obese|thin|underweight)/i,
+  ];
+  for (const p of bcsPatterns) {
+    const m = t.match(p);
+    if (m) { bcsValue = parseInt(m[1]); break; }
+  }
+
+  if (bcsValue !== null) {
     result.statuses.bcs = 'met'; result.confidence.bcs = 'high';
-    const bcsVal = parseInt(bcsMatch[1]);
-    result.findings.push('BCS ' + bcsVal + '/9 documented');
-    if (bcsVal >= 6) {
-      if (/(?:weight|obesity|diet).*(?:discuss|recommend)/i.test(text)) {
+    result.findings.push('BCS ' + bcsValue + '/9 documented');
+
+    // Weight management for BCS 6+
+    if (bcsValue >= 6) {
+      const weightDiscussed = /(?:weight|obesity|overweight|diet|lose.*(?:pound|weight)|calori).*(?:discuss|recommend|management|plan|reduce|monitor)/i.test(t) ||
+                              /(?:discuss|recommend|manage|monitor).*(?:weight|obesity|overweight|diet|calori)/i.test(t) ||
+                              /could\s*(?:lose|stand\s*to\s*lose)/i.test(t) ||
+                              /(?:lose|drop)\s*(?:a\s*(?:few|couple)?\s*(?:of\s*)?)?(?:pounds?|lbs|weight)/i.test(t) ||
+                              /weight\s*(?:management|loss|reduction)/i.test(t) ||
+                              /(?:increase\s*(?:activity|exercise)|reduce\s*(?:food|intake|portions?))/i.test(t);
+      if (weightDiscussed) {
         result.statuses.weight_mgmt = 'met'; result.confidence.weight_mgmt = 'high'; result.findings.push('Weight management discussed');
       } else {
-        result.statuses.weight_mgmt = 'not_met'; result.confidence.weight_mgmt = 'medium'; result.findings.push('BCS 6+ but no weight discussion found');
+        result.statuses.weight_mgmt = 'not_met'; result.confidence.weight_mgmt = 'medium';
+        result.findings.push('BCS ' + bcsValue + '/9 but no weight management discussion found');
+        result.gaps.push('BCS ' + bcsValue + ': weight management should be discussed');
       }
     } else {
-      result.statuses.weight_mgmt = 'na';
+      result.statuses.weight_mgmt = 'na'; result.confidence.weight_mgmt = 'high';
     }
   }
 
-  // Estimates
-  if (/estimate\s*(?:created|generated|provided|sent)/i.test(text) || /created.*estimate/i.test(text)) {
-    result.statuses.est_created = 'met'; result.confidence.est_created = 'high';
-    result.statuses.est_documented = 'met'; result.confidence.est_documented = 'high';
-    result.findings.push('Estimate creation documented');
+  // ==========================================
+  // SURGICAL
+  // ==========================================
+  if (result.demographics.intact) {
+    const snDiscussed = /(?:spay|neuter|ovariohysterectomy|castration|OVH).*(?:estimate|recommend|discuss|offered)/i.test(t) ||
+                        /(?:estimate|recommend|discuss|offered).*(?:spay|neuter)/i.test(t);
+    const snDeclined = /(?:spay|neuter).*(?:decline|refused)/i.test(t);
+    if (snDiscussed) {
+      result.statuses.spay_neuter = 'met'; result.confidence.spay_neuter = 'high'; result.findings.push('Spay/neuter discussed');
+    } else if (snDeclined) {
+      result.statuses.spay_neuter = 'declined'; result.confidence.spay_neuter = 'high'; result.findings.push('Spay/neuter declined');
+    }
   }
 
-  // Spay/neuter
-  if (/(?:spay|neuter).*(?:estimate|recommend|discuss)/i.test(text)) {
-    result.statuses.spay_neuter = 'met'; result.confidence.spay_neuter = 'high'; result.findings.push('Spay/neuter discussed');
-  } else if (/(?:spay|neuter).*decline/i.test(text)) {
-    result.statuses.spay_neuter = 'declined'; result.confidence.spay_neuter = 'high'; result.findings.push('Spay/neuter declined');
+  // ==========================================
+  // SENIOR CARE
+  // ==========================================
+  if (isSenior) {
+    const seniorVisitDiscussed = /(?:senior|twice|2\s*(?:times|x)|bi[\-\s]*annual|every\s*6\s*months?).*(?:visit|exam|check[\-\s]*up|wellness)/i.test(t) ||
+                                /(?:visit|exam).*(?:twice|2x|every\s*6\s*months?|bi[\-\s]*annual)/i.test(t) ||
+                                /Senior\s*(?:Comprehensive\s*)?Consultation/i.test(t) ||
+                                /senior\s*wellness/i.test(t);
+    if (seniorVisitDiscussed) {
+      result.statuses.senior_visit = 'partial'; result.confidence.senior_visit = 'low';
+      result.findings.push('Senior visit type noted (verify 2x/year frequency discussed)');
+    }
+  }
+
+  // ==========================================
+  // ESTIMATE DOCUMENTATION
+  // ==========================================
+  // Shepherd: "Est for X", "estimate created", "estimate sent", "estimate provided"
+  const estCreated = /(?:estimate|est)\s*(?:created|generated|provided|sent|given)/i.test(t) ||
+                     /created.*(?:estimate|est\b)/i.test(t) ||
+                     /Est\s*(?:for|:)\s*.+/i.test(t);
+  const estInRecord = /(?:estimate|est)\s*(?:noted|documented|in\s*(?:record|chart))/i.test(t) ||
+                      /(?:documented|noted).*(?:estimate|est\b)/i.test(t);
+
+  // Check for services that SHOULD have estimates
+  const needsEstimates = [];
+  if (result.statuses.wellness_bw === 'partial' || bwRecommended) needsEstimates.push('bloodwork');
+  if (result.statuses.fecal === 'partial' || fecalRecommended) needsEstimates.push('fecal');
+  if (result.statuses.hw_test === 'partial' || hwTestRecommended) needsEstimates.push('HW test');
+  if (dentalGradeValue >= 2 && result.statuses.dental_est !== 'met') needsEstimates.push('dental');
+
+  if (estCreated) {
+    result.statuses.est_created = 'met'; result.confidence.est_created = 'medium'; result.findings.push('Estimate creation noted');
+  } else if (needsEstimates.length > 0) {
+    // Services were recommended that need estimates
+    result.statuses.est_created = 'partial'; result.confidence.est_created = 'low';
+    result.findings.push('Services recommended (' + needsEstimates.join(', ') + ') — verify estimate created');
+    result.gaps.push('Verify estimates created for: ' + needsEstimates.join(', '));
+  }
+
+  if (estInRecord || estCreated) {
+    result.statuses.est_documented = result.statuses.est_created || 'partial';
+    result.confidence.est_documented = result.confidence.est_created || 'low';
+  } else if (needsEstimates.length > 0) {
+    result.statuses.est_documented = 'partial'; result.confidence.est_documented = 'low';
+    result.findings.push('Verify estimates documented in record');
+  }
+
+  // ==========================================
+  // VACCINE CURRENCY CHECK (from Reminder dates)
+  // ==========================================
+  // If a vaccine reminder is in the future, the vaccine is current and doesn't need to be addressed
+  const reminderSection = t.match(/Current\s*Reminders[\s\S]*?(?=Current\s*Vaccines|SOAP\s*Date|$)/i);
+  const today = new Date();
+  
+  if (reminderSection) {
+    const reminderText = reminderSection[0];
+    
+    // Rabies - if reminder is in the future, it's current
+    const rabiesReminder = reminderText.match(/Rabies\s*Vaccination.*?(\d{2})\/(\d{2})\/(\d{4})/i);
+    if (rabiesReminder && !result.statuses.rabies) {
+      const rDate = new Date(parseInt(rabiesReminder[3]), parseInt(rabiesReminder[1])-1, parseInt(rabiesReminder[2]));
+      if (rDate > today) {
+        result.statuses.rabies = 'na'; result.confidence.rabies = 'high';
+        result.findings.push('Rabies current (not due until ' + rabiesReminder[1]+'/'+rabiesReminder[2]+'/'+rabiesReminder[3] + ')');
+      }
+    }
+    
+    // DAPP/DHPP - if reminder is in the future, it's current
+    const dappReminder = reminderText.match(/(?:DAPP|DHPP|DA2PP)\s*(?:3\s*Year)?.*?(\d{2})\/(\d{2})\/(\d{4})/i);
+    if (dappReminder && !result.statuses.dhpp) {
+      const dDate = new Date(parseInt(dappReminder[3]), parseInt(dappReminder[1])-1, parseInt(dappReminder[2]));
+      if (dDate > today) {
+        result.statuses.dhpp = 'na'; result.confidence.dhpp = 'high';
+        result.findings.push('DHPP/DAPP current (not due until ' + dappReminder[1]+'/'+dappReminder[2]+'/'+dappReminder[3] + ')');
+      }
+    }
+  }
+
+  // ==========================================
+  // OVERDUE REMINDERS CHECK
+  // ==========================================
+  // Parse overdue reminders from the reminders table (red items in Shepherd)
+  if (reminderSection) {
+    const overdueItems = [];
+    const reminderLines = reminderSection[0].split('\n');
+    for (const line of reminderLines) {
+      const dateMatch = line.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+      if (dateMatch) {
+        const reminderDate = new Date(parseInt(dateMatch[3]), parseInt(dateMatch[1])-1, parseInt(dateMatch[2]));
+        if (reminderDate < today) {
+          overdueItems.push(line.trim());
+        }
+      }
+    }
+    if (overdueItems.length > 0) {
+      result.findings.push('⚠️ Overdue reminders detected: ' + overdueItems.length);
+      for (const item of overdueItems) {
+        result.gaps.push('Overdue: ' + item.substring(0, 80));
+        // Map overdue reminders to criteria that aren't already set
+        if (/bordetella/i.test(item) && !result.statuses.bordetella) {
+          result.gaps.push('Bordetella overdue and not addressed at this visit');
+        }
+        if (/heartworm/i.test(item) && !result.statuses.hw_test) {
+          result.gaps.push('Heartworm test overdue and not addressed at this visit');
+        }
+        if (/lepto/i.test(item) && !result.statuses.lepto) {
+          result.gaps.push('Lepto overdue and not addressed at this visit');
+        }
+      }
+    }
   }
 
   return result;
 }
 
-// Utilities
+// ==========================================
+// UTILITIES
+// ==========================================
 function getApplicableCriteria(species, ageYears, ageMonths, intact) {
   const totalMonths = (ageYears || 0) * 12 + (ageMonths || 0);
   return CRITERIA.filter((c) => {
@@ -284,44 +632,73 @@ function getApplicableCriteria(species, ageYears, ageMonths, intact) {
   });
 }
 
+// *** FIXED SCORING: Unset applicable criteria count as "not_met" ***
 function calculateScore(statuses, applicableCriteria) {
-  const applicable = applicableCriteria.filter((c) => statuses[c.id] && statuses[c.id] !== "na");
-  if (applicable.length === 0) return { rate: null, label: "na" };
-  const compliant = applicable.filter((c) => statuses[c.id] === "met" || statuses[c.id] === "declined").length;
-  const rate = compliant / applicable.length;
+  if (applicableCriteria.length === 0) return { rate: null, label: "na", total: 0, scored: 0, compliant: 0, unscored: 0 };
+
+  // Separate N/A items from scoreable items
+  const naItems = applicableCriteria.filter(c => statuses[c.id] === "na");
+  const scoreableItems = applicableCriteria.filter(c => statuses[c.id] !== "na");
+
+  // Conditional items that are unset can be treated as N/A
+  const conditionalUnset = scoreableItems.filter(c => c.conditional && !statuses[c.id]);
+  const actualScoreable = scoreableItems.filter(c => !(c.conditional && !statuses[c.id]));
+
+  if (actualScoreable.length === 0) return { rate: null, label: "na", total: 0, scored: 0, compliant: 0, unscored: 0 };
+
+  const scored = actualScoreable.filter(c => statuses[c.id]);
+  const unscored = actualScoreable.filter(c => !statuses[c.id]);
+  const compliant = actualScoreable.filter(c => statuses[c.id] === "met" || statuses[c.id] === "declined");
+
+  // CRITICAL FIX: Unscored items count AGAINST the score (treated as not met)
+  const rate = compliant.length / actualScoreable.length;
+
   let label = "needs_improvement";
   if (rate >= 0.9) label = "excellent";
   else if (rate >= 0.75) label = "good";
   else if (rate >= 0.5) label = "partial";
-  return { rate, label };
+
+  return {
+    rate,
+    label,
+    total: actualScoreable.length,
+    scored: scored.length,
+    compliant: compliant.length,
+    unscored: unscored.length,
+  };
 }
 
 function generateId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 5); }
-function loadData() { try { return JSON.parse(localStorage.getItem("h3-audit-v2")) || { audits: [] }; } catch { return { audits: [] }; } }
-function saveData(data) { localStorage.setItem("h3-audit-v2", JSON.stringify(data)); }
+function loadData() { try { return JSON.parse(localStorage.getItem("h3-audit-v3")) || { audits: [] }; } catch { return { audits: [] }; } }
+function saveData(data) { localStorage.setItem("h3-audit-v3", JSON.stringify(data)); }
 
 function exportCSV(audit) {
   if (!audit?.patients?.length) return;
-  const headers = ["Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score","Compliance %",...CRITERIA.map(c=>c.label),"Notes"];
+  const headers = ["Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score Label","Compliance %","Items Scored","Items Unscored","Total Applicable",...CRITERIA.map(c=>c.label),"Gaps","Notes"];
   const rows = audit.patients.map((p) => {
     const criteria = getApplicableCriteria(p.species, p.ageYears, p.ageMonths, p.intact);
     const score = calculateScore(p.statuses||{}, criteria);
     return [p.code, p.species, (p.ageYears||0)+"y "+(p.ageMonths||0)+"m", p.sex, p.intact?"Yes":"No",
       p.visitType, p.dvm||"", score.label, score.rate!==null?(score.rate*100).toFixed(0)+"%":"N/A",
-      ...CRITERIA.map(c=>(p.statuses||{})[c.id]||""), p.notes||""];
+      score.scored, score.unscored, score.total,
+      ...CRITERIA.map(c=>(p.statuses||{})[c.id]||"(unscored)"),
+      (p.gaps||[]).join("; "), p.notes||""];
   });
   const csv = [headers,...rows].map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" }); const a = document.createElement("a");
   a.href = URL.createObjectURL(blob); a.download = audit.name.replace(/[^a-zA-Z0-9]/g,"_")+"_audit.csv"; a.click();
 }
 
-// Components
+// ==========================================
+// COMPONENTS
+// ==========================================
 function StatusButton({ status, current, onClick }) {
   const opt = STATUS_OPTIONS.find(o => o.value === status);
   const active = current === status;
   return <button onClick={() => onClick(status)} style={{
     padding: "4px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer",
     border: active?"2px solid "+opt.color:"2px solid #E5E7EB", background: active?opt.bg:"#fff", color: active?opt.color:"#9CA3AF",
+    transition: "all 0.15s ease",
   }}>{opt.label}</button>;
 }
 
@@ -343,6 +720,313 @@ function ConfidenceTag({ level }) {
   return <span style={{ display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:600, marginLeft:6, background:c.bg, color:c.color }}>{labels[level]}</span>;
 }
 
+function UnscoredBadge() {
+  return <span style={{ display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:600, marginLeft:6, background:"#FEF3C7", color:"#92400E", border:"1px solid #FCD34D" }}>⚠ needs scoring</span>;
+}
+
+function ScoreDetail({ score }) {
+  if (!score || score.rate === null) return null;
+  return (
+    <div style={{ display:"flex", gap:12, alignItems:"center", fontSize:12, color:"#6B7280" }}>
+      <span>{score.compliant}/{score.total} compliant</span>
+      {score.unscored > 0 && <span style={{ color:"#DC2626", fontWeight:600 }}>⚠ {score.unscored} unscored</span>}
+    </div>
+  );
+}
+
+// Bulk PDF Upload View
+function BulkUploadView({ onSaveAll, onCancel }) {
+  const [dragOver, setDragOver] = useState(false);
+  const [files, setFiles] = useState([]);
+  const [results, setResults] = useState([]);
+  const [processing, setProcessing] = useState(false);
+  const [currentFile, setCurrentFile] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+  const fileRef = useRef();
+
+  const handleFiles = (fileList) => {
+    const pdfs = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'));
+    if (pdfs.length === 0) return;
+    setFiles(prev => [...prev, ...pdfs]);
+  };
+
+  const removeFile = (idx) => {
+    setFiles(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const processAll = async () => {
+    setProcessing(true);
+    const allResults = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      setCurrentFile(file.name + ' (' + (i+1) + '/' + files.length + ')');
+      try {
+        const text = await extractPDFText(file);
+        if (!text || text.trim().length < 50) {
+          allResults.push({ file: file.name, error: 'Could not extract text — may be image-based', parsed: null, include: false });
+        } else {
+          const parsed = parsePatientRecord(text);
+          parsed.demographics.code = file.name.replace(/\.pdf$/i, '').replace(/^Medical_Record__/, '').replace(/__\d+$/, '').substring(0, 40);
+          const criteria = getApplicableCriteria(parsed.demographics.species, parsed.demographics.ageYears, parsed.demographics.ageMonths, parsed.demographics.intact);
+          const score = calculateScore(parsed.statuses || {}, criteria);
+          allResults.push({
+            file: file.name,
+            error: null,
+            parsed,
+            score,
+            criteria,
+            include: true,
+            form: {
+              id: generateId(),
+              code: parsed.demographics.code,
+              species: parsed.demographics.species || 'canine',
+              ageYears: parsed.demographics.ageYears || 0,
+              ageMonths: parsed.demographics.ageMonths || 0,
+              sex: parsed.demographics.sex || 'female',
+              intact: parsed.demographics.intact ?? false,
+              visitType: parsed.demographics.visitType || 'wellness',
+              dvm: parsed.demographics.dvm || '',
+              statuses: { ...parsed.statuses },
+              notes: '',
+              gaps: parsed.gaps || [],
+            }
+          });
+        }
+      } catch (e) {
+        allResults.push({ file: file.name, error: 'Error: ' + e.message, parsed: null, include: false });
+      }
+    }
+    setResults(allResults);
+    setProcessing(false);
+    setCurrentFile('');
+  };
+
+  const toggleInclude = (idx) => {
+    setResults(prev => prev.map((r, i) => i === idx ? { ...r, include: !r.include } : r));
+  };
+
+  const updateStatus = (resultIdx, criteriaId, status) => {
+    setResults(prev => prev.map((r, i) => {
+      if (i !== resultIdx || !r.form) return r;
+      const newStatuses = { ...r.form.statuses, [criteriaId]: r.form.statuses[criteriaId] === status ? undefined : status };
+      const criteria = getApplicableCriteria(r.form.species, r.form.ageYears, r.form.ageMonths, r.form.intact);
+      const newScore = calculateScore(newStatuses, criteria);
+      return { ...r, form: { ...r.form, statuses: newStatuses }, score: newScore, criteria };
+    }));
+  };
+
+  const handleSaveAll = () => {
+    const patients = results.filter(r => r.include && r.form).map(r => r.form);
+    onSaveAll(patients);
+  };
+
+  const includedCount = results.filter(r => r.include && r.form).length;
+  const errorCount = results.filter(r => r.error).length;
+
+  // Stage 1: File selection
+  if (results.length === 0) {
+    return (
+      <div className="animate-in">
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+          <div>
+            <h2 style={{ margin:0, fontSize:20, fontWeight:700, color:"#1a1a1a" }}>Bulk Upload Records</h2>
+            <div style={{ fontSize:13, color:"#9CA3AF", marginTop:4 }}>Upload multiple Shepherd PDFs at once</div>
+          </div>
+          <button onClick={onCancel} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid #D1D5DB", background:"#fff", color:"#6B7280", fontWeight:600, fontSize:13, cursor:"pointer" }}>Cancel</button>
+        </div>
+
+        <Card>
+          <div className={"drop-zone"+(dragOver?" dragover":"")}
+            onDragOver={(e)=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)}
+            onDrop={(e)=>{e.preventDefault();setDragOver(false);handleFiles(e.dataTransfer.files);}}
+            onClick={()=>fileRef.current?.click()}>
+            <input ref={fileRef} type="file" accept=".pdf" multiple style={{display:"none"}} onChange={(e)=>{handleFiles(e.target.files);e.target.value='';}}/>
+            {processing ? (
+              <div>
+                <div style={{fontSize:40,marginBottom:12}}>⏳</div>
+                <div style={{fontSize:16,fontWeight:600,color:"#0F766E"}}>Processing: {currentFile}</div>
+                <div style={{marginTop:12,width:200,height:6,background:"#E5E7EB",borderRadius:3,margin:"12px auto 0"}}>
+                  <div style={{width:"50%",height:"100%",background:"#0F766E",borderRadius:3,animation:"pulse 1.5s infinite"}}/>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{fontSize:40,marginBottom:12}}>📂</div>
+                <div style={{fontSize:16,fontWeight:600,color:"#374151"}}>Drop multiple Shepherd PDFs here, or click to browse</div>
+                <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Select as many files as needed — all processed locally</div>
+              </div>
+            )}
+          </div>
+        </Card>
+
+        {files.length > 0 && (
+          <Card style={{marginTop:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <h3 style={{margin:0,fontSize:15,fontWeight:600,color:"#374151"}}>{files.length} file{files.length!==1?'s':''} queued</h3>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>setFiles([])} style={{padding:"6px 14px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:12,cursor:"pointer"}}>Clear All</button>
+                <button onClick={()=>fileRef.current?.click()} style={{padding:"6px 14px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:12,cursor:"pointer"}}>+ Add More</button>
+              </div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:240,overflowY:"auto"}}>
+              {files.map((f, i) => (
+                <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,background:"#F9FAFB",border:"1px solid #F3F4F6"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:16}}>📄</span>
+                    <span style={{fontSize:13,color:"#374151",fontWeight:500}}>{f.name}</span>
+                    <span style={{fontSize:11,color:"#9CA3AF"}}>({(f.size/1024).toFixed(0)} KB)</span>
+                  </div>
+                  <button onClick={()=>removeFile(i)} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:16,padding:"0 4px"}}>×</button>
+                </div>
+              ))}
+            </div>
+            <div style={{marginTop:16,display:"flex",justifyContent:"flex-end"}}>
+              <button onClick={processAll} disabled={processing}
+                style={{padding:"10px 24px",borderRadius:8,border:"none",background:processing?"#9CA3AF":"#0F766E",color:"#fff",fontWeight:600,fontSize:14,cursor:processing?"default":"pointer"}}>
+                {processing ? '⏳ Processing...' : '🔍 Analyze All (' + files.length + ' files)'}
+              </button>
+            </div>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  // Stage 2: Review results
+  return (
+    <div className="animate-in">
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+        <div>
+          <h2 style={{ margin:0, fontSize:20, fontWeight:700, color:"#1a1a1a" }}>Review Bulk Import</h2>
+          <div style={{ fontSize:13, color:"#9CA3AF", marginTop:4 }}>
+            {includedCount} of {results.length} records selected
+            {errorCount > 0 && <span style={{color:"#DC2626",fontWeight:600}}> · {errorCount} failed</span>}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>{setResults([]);setFiles([]);}} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:13,cursor:"pointer"}}>← Back to Upload</button>
+          <button onClick={onCancel} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:13,cursor:"pointer"}}>Cancel</button>
+        </div>
+      </div>
+
+      {/* Summary bar */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:16}}>
+        <Card style={{padding:14,textAlign:"center"}}><div style={{fontSize:22,fontWeight:700}}>{results.length}</div><div style={{fontSize:11,color:"#6B7280"}}>Processed</div></Card>
+        <Card style={{padding:14,textAlign:"center"}}><div style={{fontSize:22,fontWeight:700,color:"#059669"}}>{results.filter(r=>r.parsed&&!r.error).length}</div><div style={{fontSize:11,color:"#6B7280"}}>Successful</div></Card>
+        <Card style={{padding:14,textAlign:"center"}}><div style={{fontSize:22,fontWeight:700,color:"#DC2626"}}>{errorCount}</div><div style={{fontSize:11,color:"#6B7280"}}>Failed</div></Card>
+        <Card style={{padding:14,textAlign:"center"}}><div style={{fontSize:22,fontWeight:700,color:"#0F766E"}}>{includedCount}</div><div style={{fontSize:11,color:"#6B7280"}}>Selected</div></Card>
+      </div>
+
+      {/* Results list */}
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:16}}>
+        {results.map((r, idx) => {
+          const isExpanded = expandedId === idx;
+          const categories = {};
+          if (r.criteria && r.form) {
+            r.criteria.forEach(c => { if(!categories[c.cat]) categories[c.cat]=[]; categories[c.cat].push(c); });
+          }
+          return (
+            <Card key={idx} style={{padding:0,overflow:"hidden",border: r.error ? "1px solid #FECACA" : r.include ? "1px solid #A7F3D0" : "1px solid #E8E6E1"}}>
+              {/* Header row */}
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",cursor:r.parsed?"pointer":"default",background:r.error?"#FEF2F2":"#fff"}}
+                onClick={()=>r.parsed && setExpandedId(isExpanded?null:idx)}>
+                <div style={{display:"flex",alignItems:"center",gap:12}}>
+                  {r.parsed && (
+                    <label style={{display:"flex",alignItems:"center",cursor:"pointer"}} onClick={e=>e.stopPropagation()}>
+                      <input type="checkbox" checked={r.include} onChange={()=>toggleInclude(idx)}
+                        style={{width:16,height:16,accentColor:"#0F766E",cursor:"pointer"}}/>
+                    </label>
+                  )}
+                  <span style={{fontSize:18}}>{r.error ? '⚠️' : r.form?.species==="feline"?"🐈":"🐕"}</span>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:600,color:r.error?"#991B1B":"#1a1a1a"}}>{r.form?.code || r.file}</div>
+                    {r.parsed && (
+                      <div style={{fontSize:12,color:"#9CA3AF"}}>
+                        {r.form?.species==="canine"?"Canine":"Feline"}, {r.form?.ageYears}y {r.form?.ageMonths}m · {r.form?.dvm||"No DVM"} · {r.parsed?.findings?.length||0} items detected
+                        {r.score?.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {r.score.unscored} unscored</span>}
+                      </div>
+                    )}
+                    {r.error && <div style={{fontSize:12,color:"#DC2626"}}>{r.error}</div>}
+                  </div>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  {r.score && <ScoreBadge score={r.score.label} size="small" />}
+                  {r.score?.rate!==null && <span style={{fontSize:14,fontWeight:700,color:r.score.rate>=0.9?"#059669":r.score.rate>=0.75?"#0D9488":r.score.rate>=0.5?"#D97706":"#DC2626"}}>{(r.score.rate*100).toFixed(0)}%</span>}
+                  {r.parsed && <span style={{fontSize:18,color:"#9CA3AF",transition:"transform 0.2s",transform:isExpanded?"rotate(180deg)":"rotate(0deg)"}}>▾</span>}
+                </div>
+              </div>
+
+              {/* Expanded detail */}
+              {isExpanded && r.parsed && (
+                <div style={{borderTop:"1px solid #F3F4F6",padding:"12px 16px",background:"#FAFAF8"}}>
+                  {/* Findings */}
+                  {r.parsed.findings?.length > 0 && (
+                    <div style={{marginBottom:12}}>
+                      <div style={{fontSize:12,fontWeight:600,color:"#6B7280",marginBottom:6}}>AUTO-DETECTED</div>
+                      <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                        {r.parsed.findings.map((f,fi)=><span key={fi} style={{fontSize:11,padding:"2px 8px",background:f.startsWith('⚠')?"#FEF3C7":"#E0F2FE",color:f.startsWith('⚠')?"#92400E":"#0369A1",borderRadius:16}}>{f}</span>)}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Gaps */}
+                  {r.parsed.gaps?.length > 0 && (
+                    <div style={{marginBottom:12,padding:"8px 12px",background:"#FEF2F2",borderRadius:8,border:"1px solid #FECACA"}}>
+                      <div style={{fontSize:12,fontWeight:700,color:"#991B1B",marginBottom:4}}>GAPS</div>
+                      {r.parsed.gaps.map((g,gi)=><div key={gi} style={{fontSize:12,color:"#7F1D1D"}}>• {g}</div>)}
+                    </div>
+                  )}
+
+                  {/* Inline criteria scoring */}
+                  {Object.entries(categories).map(([catName, catCriteria]) => (
+                    <div key={catName} style={{marginBottom:10}}>
+                      <div style={{fontSize:12,fontWeight:700,color:"#0F766E",textTransform:"uppercase",marginBottom:6}}>{catName}</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                        {catCriteria.map(c => {
+                          const isUnscored = !r.form.statuses[c.id] && !c.conditional;
+                          return (
+                            <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 10px",borderRadius:6,fontSize:12,
+                              background: isUnscored ? "#FFFBEB" : "#fff",
+                              border: isUnscored ? "1px solid #FCD34D" : "1px solid #F3F4F6",
+                              borderLeft: isUnscored ? "3px solid #F59E0B" : (r.parsed.confidence?.[c.id]==="high"?"3px solid #059669":r.parsed.confidence?.[c.id]==="medium"?"3px solid #D97706":"1px solid #F3F4F6")}}>
+                              <div style={{flex:1,marginRight:8}}>
+                                <span style={{fontWeight:500,color:"#374151"}}>{c.label}</span>
+                                {isUnscored && <span style={{marginLeft:6,fontSize:10,padding:"1px 6px",borderRadius:3,background:"#FEF3C7",color:"#92400E",fontWeight:600}}>⚠</span>}
+                              </div>
+                              <div style={{display:"flex",gap:3}}>
+                                {STATUS_OPTIONS.map(opt => {
+                                  const active = r.form.statuses[c.id] === opt.value;
+                                  return <button key={opt.value} onClick={()=>updateStatus(idx,c.id,opt.value)} style={{
+                                    padding:"2px 7px",borderRadius:4,fontSize:10,fontWeight:600,cursor:"pointer",
+                                    border:active?"2px solid "+opt.color:"1px solid #E5E7EB",background:active?opt.bg:"#fff",color:active?opt.color:"#C0C0C0",
+                                  }}>{opt.label}</button>;
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* Action bar */}
+      <div style={{display:"flex",gap:8,justifyContent:"flex-end",position:"sticky",bottom:0,padding:"12px 0",background:"#F7F6F3"}}>
+        <button onClick={()=>{setResults([]);setFiles([]);}} style={{padding:"10px 20px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:14,cursor:"pointer"}}>← Re-upload</button>
+        <button onClick={handleSaveAll} disabled={includedCount===0}
+          style={{padding:"10px 24px",borderRadius:8,border:"none",background:includedCount>0?"#0F766E":"#D1D5DB",color:"#fff",fontWeight:600,fontSize:14,cursor:includedCount>0?"pointer":"default"}}>
+          ✓ Import {includedCount} Patient{includedCount!==1?'s':''}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // PDF Upload View
 function PDFUploadView({ onParsed, onCancel }) {
   const [dragOver, setDragOver] = useState(false);
@@ -355,7 +1039,7 @@ function PDFUploadView({ onParsed, onCancel }) {
     setParsing(true); setError(null);
     try {
       const text = await extractPDFText(file);
-      if (!text || text.trim().length < 50) { setError('Could not extract text. The PDF may be image-based.'); setParsing(false); return; }
+      if (!text || text.trim().length < 50) { setError('Could not extract text from this PDF. The file may be image-based or scanned. Try a Shepherd-exported PDF with selectable text.'); setParsing(false); return; }
       const parsed = parsePatientRecord(text);
       parsed.demographics.code = file.name.replace(/\.pdf$/i, '').substring(0, 40);
       onParsed(parsed);
@@ -364,7 +1048,7 @@ function PDFUploadView({ onParsed, onCancel }) {
   };
 
   return (
-    <div>
+    <div className="animate-in">
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
         <h2 style={{ margin:0, fontSize:20, fontWeight:700, color:"#1a1a1a" }}>Upload Patient Record</h2>
         <button onClick={onCancel} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid #D1D5DB", background:"#fff", color:"#6B7280", fontWeight:600, fontSize:13, cursor:"pointer" }}>Cancel</button>
@@ -376,10 +1060,10 @@ function PDFUploadView({ onParsed, onCancel }) {
           onClick={()=>fileRef.current?.click()}>
           <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={(e)=>handleFile(e.target.files[0])}/>
           {parsing ? (
-            <div><div style={{fontSize:40,marginBottom:12}}>📄</div><div style={{fontSize:16,fontWeight:600,color:"#0F766E"}}>Extracting text...</div></div>
+            <div><div style={{fontSize:40,marginBottom:12}}>📄</div><div style={{fontSize:16,fontWeight:600,color:"#0F766E"}}>Extracting text & analyzing record...</div></div>
           ) : (
             <div><div style={{fontSize:40,marginBottom:12}}>📄</div><div style={{fontSize:16,fontWeight:600,color:"#374151"}}>Drop a Shepherd PDF here, or click to browse</div>
-              <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>PDF is processed locally — nothing leaves your computer</div></div>
+              <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>PDF must have selectable text (not scanned/image-based)</div></div>
           )}
         </div>
         {error && <div style={{marginTop:12,padding:"10px 14px",background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,fontSize:13,color:"#991B1B"}}>⚠️ {error}</div>}
@@ -395,7 +1079,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
     ageYears: parsed.demographics.ageYears || 0, ageMonths: parsed.demographics.ageMonths || 0,
     sex: parsed.demographics.sex || 'female', intact: parsed.demographics.intact ?? false,
     visitType: parsed.demographics.visitType || 'wellness', dvm: parsed.demographics.dvm || '',
-    statuses: { ...parsed.statuses }, notes: '',
+    statuses: { ...parsed.statuses }, notes: '', gaps: parsed.gaps || [],
   }));
   const [showRaw, setShowRaw] = useState(false);
 
@@ -411,12 +1095,25 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
   const labelStyle = { fontSize:12, fontWeight:600, color:"#6B7280", marginBottom:4, display:"block", textTransform:"uppercase", letterSpacing:"0.5px" };
 
   return (
-    <div>
+    <div className="animate-in">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
         <div><h2 style={{margin:0,fontSize:20,fontWeight:700,color:"#1a1a1a"}}>Review Extracted Data</h2>
-          <div style={{fontSize:13,color:"#9CA3AF",marginTop:4}}>{parsed.findings.length} items auto-detected</div></div>
-        <ScoreBadge score={score.label} />
+          <div style={{fontSize:13,color:"#9CA3AF",marginTop:4}}>{parsed.findings.length} items auto-detected · {score.unscored > 0 ? <span style={{color:"#DC2626",fontWeight:600}}>{score.unscored} items need scoring</span> : "All items scored"}</div></div>
+        <div style={{textAlign:"right"}}>
+          <ScoreBadge score={score.label} />
+          <div style={{fontSize:12,color:"#6B7280",marginTop:4}}>{score.compliant}/{score.total} compliant ({score.rate!==null?(score.rate*100).toFixed(0):'0'}%)</div>
+        </div>
       </div>
+
+      {/* Gaps Alert */}
+      {parsed.gaps && parsed.gaps.length > 0 && (
+        <Card style={{marginBottom:16,padding:16,background:"#FEF2F2",border:"1px solid #FECACA"}}>
+          <h3 style={{margin:"0 0 8px 0",fontSize:14,fontWeight:700,color:"#991B1B"}}>⚠️ Gaps Identified ({parsed.gaps.length})</h3>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {parsed.gaps.map((g,i) => <div key={i} style={{fontSize:13,color:"#7F1D1D",padding:"3px 0"}}>• {g}</div>)}
+          </div>
+        </Card>
+      )}
 
       {parsed.findings.length > 0 && (
         <Card style={{marginBottom:16,padding:16,background:"#F8FAFC"}}>
@@ -424,7 +1121,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
             <h3 style={{margin:0,fontSize:14,fontWeight:600,color:"#374151"}}>🔍 Detected ({parsed.findings.length})</h3>
             <button onClick={()=>setShowRaw(!showRaw)} style={{fontSize:12,color:"#0F766E",background:"none",border:"none",cursor:"pointer",fontWeight:600}}>{showRaw?"Hide":"Show"} raw text</button>
           </div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{parsed.findings.map((f,i)=><span key={i} style={{fontSize:12,padding:"3px 10px",background:"#E0F2FE",color:"#0369A1",borderRadius:20}}>{f}</span>)}</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{parsed.findings.map((f,i)=><span key={i} style={{fontSize:12,padding:"3px 10px",background:f.startsWith('⚠')?"#FEF3C7":"#E0F2FE",color:f.startsWith('⚠')?"#92400E":"#0369A1",borderRadius:20}}>{f}</span>)}</div>
           {showRaw && <div style={{marginTop:12,padding:12,background:"#fff",borderRadius:8,border:"1px solid #E5E7EB",maxHeight:200,overflow:"auto",fontSize:11,fontFamily:"monospace",color:"#6B7280",whiteSpace:"pre-wrap"}}>{parsed.extractedText}</div>}
         </Card>
       )}
@@ -460,24 +1157,33 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
         <Card key={catName} style={{marginBottom:12,padding:16}}>
           <h3 style={{margin:"0 0 12px 0",fontSize:14,fontWeight:700,color:"#0F766E",textTransform:"uppercase"}}>{catName}</h3>
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            {catCriteria.map(c => (
-              <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,background:form.statuses[c.id]?"#FAFAF8":"#fff",border:"1px solid #F3F4F6",
-                borderLeft:parsed.confidence[c.id]?(parsed.confidence[c.id]==="high"?"3px solid #059669":"3px solid #D97706"):"1px solid #F3F4F6"}}>
-                <div style={{flex:1,marginRight:12}}>
-                  <div style={{fontSize:13,fontWeight:500,color:"#374151"}}>{c.label}{c.conditional&&<span style={{fontSize:11,color:"#D97706",marginLeft:6}}>(if applicable)</span>}
-                    {parsed.statuses[c.id] && <ConfidenceTag level={parsed.confidence[c.id]}/>}</div>
-                  <div style={{fontSize:11,color:"#9CA3AF",marginTop:2}}>{c.note}</div>
+            {catCriteria.map(c => {
+              const isUnscored = !form.statuses[c.id] && !c.conditional;
+              return (
+                <div key={c.id} className={isUnscored?"unscored-row":""} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,
+                  background: isUnscored ? "#FFFBEB" : (form.statuses[c.id]?"#FAFAF8":"#fff"),
+                  border: isUnscored ? "1px solid #FCD34D" : "1px solid #F3F4F6",
+                  borderLeft: isUnscored ? "3px solid #F59E0B" : (parsed.confidence[c.id]?(parsed.confidence[c.id]==="high"?"3px solid #059669":parsed.confidence[c.id]==="medium"?"3px solid #D97706":"3px solid #DC2626"):"1px solid #F3F4F6")}}>
+                  <div style={{flex:1,marginRight:12}}>
+                    <div style={{fontSize:13,fontWeight:500,color:"#374151"}}>
+                      {c.label}
+                      {c.conditional&&<span style={{fontSize:11,color:"#D97706",marginLeft:6}}>(if applicable)</span>}
+                      {parsed.statuses[c.id] && <ConfidenceTag level={parsed.confidence[c.id]}/>}
+                      {isUnscored && <UnscoredBadge />}
+                    </div>
+                    <div style={{fontSize:11,color:"#9CA3AF",marginTop:2}}>{c.note}</div>
+                  </div>
+                  <div style={{display:"flex",gap:4}}>{STATUS_OPTIONS.map(opt=><StatusButton key={opt.value} status={opt.value} current={form.statuses[c.id]} onClick={s=>setStatus(c.id,s)}/>)}</div>
                 </div>
-                <div style={{display:"flex",gap:4}}>{STATUS_OPTIONS.map(opt=><StatusButton key={opt.value} status={opt.value} current={form.statuses[c.id]} onClick={s=>setStatus(c.id,s)}/>)}</div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       ))}
 
       <Card style={{marginBottom:16,padding:16}}>
         <label style={labelStyle}>Audit Notes</label>
-        <textarea value={form.notes} onChange={e=>setField("notes",e.target.value)} placeholder="Notes..." rows={3} style={{...inputStyle,resize:"vertical"}}/>
+        <textarea value={form.notes} onChange={e=>setField("notes",e.target.value)} placeholder="Notes about this audit..." rows={3} style={{...inputStyle,resize:"vertical"}}/>
       </Card>
 
       <div style={{display:"flex",gap:8,justifyContent:"flex-end",position:"sticky",bottom:0,padding:"12px 0",background:"#F7F6F3"}}>
@@ -490,7 +1196,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
 
 // Manual Patient Form
 function PatientForm({ patient, onSave, onCancel }) {
-  const [form, setForm] = useState(patient || { id:generateId(), code:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"" });
+  const [form, setForm] = useState(patient || { id:generateId(), code:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"", gaps:[] });
   const criteria = useMemo(() => getApplicableCriteria(form.species, form.ageYears, form.ageMonths, form.intact), [form]);
   const setField = (f, v) => setForm(p => ({ ...p, [f]: v }));
   const setStatus = (cid, s) => setForm(p => ({ ...p, statuses: { ...p.statuses, [cid]: p.statuses[cid]===s?undefined:s } }));
@@ -503,10 +1209,16 @@ function PatientForm({ patient, onSave, onCancel }) {
   const labelStyle = { fontSize:12, fontWeight:600, color:"#6B7280", marginBottom:4, display:"block", textTransform:"uppercase" };
 
   return (
-    <div>
+    <div className="animate-in">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
-        <h2 style={{margin:0,fontSize:20,fontWeight:700,color:"#1a1a1a"}}>{patient?"Edit":"Add"} Patient</h2>
-        <ScoreBadge score={score.label} />
+        <div>
+          <h2 style={{margin:0,fontSize:20,fontWeight:700,color:"#1a1a1a"}}>{patient?"Edit":"Add"} Patient</h2>
+          {score.unscored > 0 && <div style={{fontSize:12,color:"#DC2626",fontWeight:600,marginTop:4}}>⚠ {score.unscored} items unscored — these count as "Not Met"</div>}
+        </div>
+        <div style={{textAlign:"right"}}>
+          <ScoreBadge score={score.label} />
+          <div style={{fontSize:12,color:"#6B7280",marginTop:4}}>{score.compliant}/{score.total} ({score.rate!==null?(score.rate*100).toFixed(0):'0'}%)</div>
+        </div>
       </div>
       <Card style={{marginBottom:16}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
@@ -535,15 +1247,23 @@ function PatientForm({ patient, onSave, onCancel }) {
         <Card key={catName} style={{marginBottom:12,padding:16}}>
           <h3 style={{margin:"0 0 12px 0",fontSize:14,fontWeight:700,color:"#0F766E",textTransform:"uppercase"}}>{catName}</h3>
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            {catCriteria.map(c => (
-              <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,background:form.statuses[c.id]?"#FAFAF8":"#fff",border:"1px solid #F3F4F6"}}>
-                <div style={{flex:1,marginRight:12}}>
-                  <div style={{fontSize:13,fontWeight:500,color:"#374151"}}>{c.label}{c.conditional&&<span style={{fontSize:11,color:"#D97706",marginLeft:6}}>(if applicable)</span>}</div>
-                  <div style={{fontSize:11,color:"#9CA3AF",marginTop:2}}>{c.note}</div>
+            {catCriteria.map(c => {
+              const isUnscored = !form.statuses[c.id] && !c.conditional;
+              return (
+                <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:8,
+                  background: isUnscored ? "#FFFBEB" : (form.statuses[c.id]?"#FAFAF8":"#fff"),
+                  border: isUnscored ? "1px solid #FCD34D" : "1px solid #F3F4F6",
+                  borderLeft: isUnscored ? "3px solid #F59E0B" : "1px solid #F3F4F6" }}>
+                  <div style={{flex:1,marginRight:12}}>
+                    <div style={{fontSize:13,fontWeight:500,color:"#374151"}}>{c.label}{c.conditional&&<span style={{fontSize:11,color:"#D97706",marginLeft:6}}>(if applicable)</span>}
+                      {isUnscored && <UnscoredBadge />}
+                    </div>
+                    <div style={{fontSize:11,color:"#9CA3AF",marginTop:2}}>{c.note}</div>
+                  </div>
+                  <div style={{display:"flex",gap:4}}>{STATUS_OPTIONS.map(opt=><StatusButton key={opt.value} status={opt.value} current={form.statuses[c.id]} onClick={s=>setStatus(c.id,s)}/>)}</div>
                 </div>
-                <div style={{display:"flex",gap:4}}>{STATUS_OPTIONS.map(opt=><StatusButton key={opt.value} status={opt.value} current={form.statuses[c.id]} onClick={s=>setStatus(c.id,s)}/>)}</div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       ))}
@@ -563,35 +1283,89 @@ function PatientForm({ patient, onSave, onCancel }) {
 function Dashboard({ audit }) {
   const stats = useMemo(() => {
     if (!audit?.patients?.length) return null;
-    const scores = audit.patients.map(p => calculateScore(p.statuses||{}, getApplicableCriteria(p.species,p.ageYears,p.ageMonths,p.intact)));
+    const patientData = audit.patients.map(p => {
+      const criteria = getApplicableCriteria(p.species,p.ageYears,p.ageMonths,p.intact);
+      return { ...p, score: calculateScore(p.statuses||{}, criteria), criteria };
+    });
     const distribution = { excellent:0, good:0, partial:0, needs_improvement:0 };
-    scores.forEach(s => { if(distribution[s.label]!==undefined) distribution[s.label]++; });
-    const ratedScores = scores.filter(s => s.rate!==null);
-    const avgRate = ratedScores.length ? ratedScores.reduce((a,s)=>a+s.rate,0)/ratedScores.length : 0;
-    return { patients: audit.patients.length, distribution, avgRate };
+    patientData.forEach(p => { if(distribution[p.score.label]!==undefined) distribution[p.score.label]++; });
+    const ratedScores = patientData.filter(p => p.score.rate!==null);
+    const avgRate = ratedScores.length ? ratedScores.reduce((a,p)=>a+p.score.rate,0)/ratedScores.length : 0;
+    const totalUnscored = patientData.reduce((a,p)=>a+p.score.unscored,0);
+
+    // Category breakdown
+    const catStats = {};
+    CRITERIA.forEach(c => {
+      if (!catStats[c.cat]) catStats[c.cat] = { met: 0, partial: 0, not_met: 0, declined: 0, na: 0, unscored: 0, total: 0 };
+    });
+    patientData.forEach(p => {
+      p.criteria.forEach(c => {
+        const stat = catStats[c.cat];
+        stat.total++;
+        const status = (p.statuses||{})[c.id];
+        if (!status && !c.conditional) stat.unscored++;
+        else if (status === 'met') stat.met++;
+        else if (status === 'partial') stat.partial++;
+        else if (status === 'not_met') stat.not_met++;
+        else if (status === 'declined') stat.declined++;
+        else if (status === 'na') stat.na++;
+        else if (!status && c.conditional) stat.na++;
+      });
+    });
+
+    return { patients: audit.patients.length, distribution, avgRate, totalUnscored, catStats, patientData };
   }, [audit]);
 
   if (!stats) return <div style={{textAlign:"center",padding:60,color:"#9CA3AF"}}><div style={{fontSize:40,marginBottom:12}}>📊</div><div>No patients yet</div></div>;
 
   return (
-    <div>
+    <div className="animate-in">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
         <h2 style={{margin:0,fontSize:20,fontWeight:700,color:"#1a1a1a"}}>Audit Summary</h2>
         <button onClick={()=>exportCSV(audit)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:13,cursor:"pointer"}}>📥 Export CSV</button>
       </div>
+
+      {stats.totalUnscored > 0 && (
+        <div style={{marginBottom:16,padding:"12px 16px",background:"#FEF3C7",border:"1px solid #FCD34D",borderRadius:8,fontSize:13,color:"#92400E",fontWeight:500}}>
+          ⚠️ <strong>{stats.totalUnscored} items across all patients are unscored</strong> — these count against compliance. Review patients to ensure all criteria are scored.
+        </div>
+      )}
+
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:12,marginBottom:20}}>
         <Card style={{padding:16,textAlign:"center"}}><div style={{fontSize:28,fontWeight:700}}>{stats.patients}</div><div style={{fontSize:12,color:"#6B7280"}}>Patients</div></Card>
-        <Card style={{padding:16,textAlign:"center"}}><div style={{fontSize:28,fontWeight:700,color:"#0F766E"}}>{(stats.avgRate*100).toFixed(0)}%</div><div style={{fontSize:12,color:"#6B7280"}}>Avg Compliance</div></Card>
+        <Card style={{padding:16,textAlign:"center"}}><div style={{fontSize:28,fontWeight:700,color:stats.avgRate>=0.75?"#0F766E":stats.avgRate>=0.5?"#D97706":"#DC2626"}}>{(stats.avgRate*100).toFixed(0)}%</div><div style={{fontSize:12,color:"#6B7280"}}>Avg Compliance</div></Card>
         <Card style={{padding:16,textAlign:"center"}}><div style={{fontSize:28,fontWeight:700,color:"#059669"}}>{stats.distribution.excellent+stats.distribution.good}</div><div style={{fontSize:12,color:"#6B7280"}}>Excellent/Good</div></Card>
         <Card style={{padding:16,textAlign:"center"}}><div style={{fontSize:28,fontWeight:700,color:"#DC2626"}}>{stats.distribution.needs_improvement}</div><div style={{fontSize:12,color:"#6B7280"}}>Needs Improvement</div></Card>
       </div>
-      <Card style={{padding:20}}>
+
+      <Card style={{padding:20,marginBottom:16}}>
         <h3 style={{margin:"0 0 16px 0",fontSize:15,fontWeight:600,color:"#374151"}}>Score Distribution</h3>
         <div style={{display:"flex",gap:12}}>
           {Object.entries(SCORE_LABELS).map(([key,val])=>{const count=stats.distribution[key]||0;
             return <div key={key} style={{flex:1,textAlign:"center",padding:12,borderRadius:8,background:count>0?val.bg:"#F9FAFB"}}>
               <div style={{fontSize:24,fontWeight:700,color:count>0?val.color:"#D1D5DB"}}>{count}</div>
               <div style={{fontSize:11,fontWeight:600,color:count>0?val.color:"#9CA3AF"}}>{val.label}</div></div>;
+          })}
+        </div>
+      </Card>
+
+      <Card style={{padding:20}}>
+        <h3 style={{margin:"0 0 16px 0",fontSize:15,fontWeight:600,color:"#374151"}}>Category Compliance Breakdown</h3>
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {Object.entries(stats.catStats).map(([cat, s]) => {
+            const scoreable = s.total - s.na;
+            const compliant = s.met + s.declined;
+            const rate = scoreable > 0 ? compliant / scoreable : 0;
+            return (
+              <div key={cat} style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0",borderBottom:"1px solid #F3F4F6"}}>
+                <div style={{width:180,fontSize:13,fontWeight:600,color:"#374151"}}>{cat}</div>
+                <div style={{flex:1,height:8,background:"#F3F4F6",borderRadius:4,overflow:"hidden"}}>
+                  <div style={{width:(rate*100)+"%",height:"100%",background:rate>=0.75?"#059669":rate>=0.5?"#D97706":"#DC2626",borderRadius:4,transition:"width 0.3s ease"}}/>
+                </div>
+                <div style={{width:50,textAlign:"right",fontSize:13,fontWeight:700,color:rate>=0.75?"#059669":rate>=0.5?"#D97706":"#DC2626"}}>{(rate*100).toFixed(0)}%</div>
+                {s.unscored > 0 && <span style={{fontSize:11,color:"#92400E",fontWeight:600}}>({s.unscored} unscored)</span>}
+              </div>
+            );
           })}
         </div>
       </Card>
@@ -612,6 +1386,12 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
     else updated.patients.push(patient);
     onUpdate(updated);
     setMode(null); setParsedData(null);
+  };
+
+  const handleBulkSave = (patients) => {
+    const updated = { ...audit, patients: [...audit.patients, ...patients] };
+    onUpdate(updated);
+    setMode(null);
   };
 
   const handleDeletePatient = (id) => {
@@ -637,25 +1417,27 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
       </div>
 
       {tab === "dashboard" && <Dashboard audit={audit} />}
+      {tab === "patients" && mode === "bulk" && <BulkUploadView onSaveAll={handleBulkSave} onCancel={()=>setMode(null)} />}
       {tab === "patients" && mode === "upload" && <PDFUploadView onParsed={(p)=>{setParsedData(p);setMode("review");}} onCancel={()=>setMode(null)} />}
       {tab === "patients" && mode === "review" && parsedData && <ParsedReviewView parsed={parsedData} onSave={handleSavePatient} onCancel={()=>{setMode(null);setParsedData(null);}} />}
       {tab === "patients" && mode === "manual" && <PatientForm patient={null} onSave={handleSavePatient} onCancel={()=>setMode(null)} />}
-      {tab === "patients" && mode && !["upload","manual","review"].includes(mode) && <PatientForm patient={audit.patients.find(p=>p.id===mode)} onSave={handleSavePatient} onCancel={()=>setMode(null)} />}
+      {tab === "patients" && mode && !["upload","manual","review","bulk"].includes(mode) && <PatientForm patient={audit.patients.find(p=>p.id===mode)} onSave={handleSavePatient} onCancel={()=>setMode(null)} />}
       
       {tab === "patients" && !mode && (
         <div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
             <h2 style={{margin:0,fontSize:18,fontWeight:600,color:"#374151"}}>Patients</h2>
             <div style={{display:"flex",gap:8}}>
-              <button onClick={()=>setMode("upload")} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#0F766E",color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer"}}>📄 Upload PDF</button>
-              <button onClick={()=>setMode("manual")} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:13,cursor:"pointer"}}>+ Manual Entry</button>
+              <button onClick={()=>setMode("bulk")} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#0F766E",color:"#fff",fontWeight:600,fontSize:13,cursor:"pointer"}}>📂 Bulk Upload</button>
+              <button onClick={()=>setMode("upload")} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #0F766E",background:"#fff",color:"#0F766E",fontWeight:600,fontSize:13,cursor:"pointer"}}>📄 Single PDF</button>
+              <button onClick={()=>setMode("manual")} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #D1D5DB",background:"#fff",color:"#6B7280",fontWeight:600,fontSize:13,cursor:"pointer"}}>+ Manual</button>
             </div>
           </div>
           {audit.patients.length === 0 ? (
             <Card style={{textAlign:"center",padding:40}}>
               <div style={{fontSize:32,marginBottom:8}}>📋</div>
               <div style={{fontSize:15,color:"#6B7280",fontWeight:500}}>No patients yet</div>
-              <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Upload a Shepherd PDF or add patients manually.</div>
+              <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Use Bulk Upload for multiple records, Single PDF for one at a time, or add manually.</div>
             </Card>
           ) : (
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -663,14 +1445,16 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
                 const criteria = getApplicableCriteria(p.species, p.ageYears, p.ageMonths, p.intact);
                 const score = calculateScore(p.statuses||{}, criteria);
                 return (
-                  <Card key={p.id} style={{padding:14,cursor:"pointer"}} onClick={()=>setMode(p.id)}
+                  <Card key={p.id} style={{padding:14,cursor:"pointer",transition:"border-color 0.15s ease"}} onClick={()=>setMode(p.id)}
                     onMouseEnter={e=>e.currentTarget.style.borderColor="#0D9488"} onMouseLeave={e=>e.currentTarget.style.borderColor="#E8E6E1"}>
                     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
                       <div style={{display:"flex",alignItems:"center",gap:12}}>
                         <span style={{fontSize:20}}>{p.species==="canine"?"🐕":"🐈"}</span>
                         <div>
                           <div style={{fontSize:14,fontWeight:600,color:"#1a1a1a"}}>{p.code||"Unnamed"} — {p.species==="canine"?"Canine":"Feline"}, {p.ageYears}y {p.ageMonths}m</div>
-                          <div style={{fontSize:12,color:"#9CA3AF"}}>{p.visitType} · {p.dvm||"No DVM"}</div>
+                          <div style={{fontSize:12,color:"#9CA3AF"}}>{p.visitType} · {p.dvm||"No DVM"} · {score.compliant}/{score.total} compliant
+                            {score.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {score.unscored} unscored</span>}
+                          </div>
                         </div>
                       </div>
                       <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -698,7 +1482,8 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
       <div style={{textAlign:"center",marginBottom:40}}>
         <div style={{fontSize:48,marginBottom:12}}>🩺</div>
         <h1 style={{fontSize:28,fontWeight:700,color:"#1a1a1a"}}>H3 Preventative Care Audit Tool</h1>
-        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Upload Shepherd PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
+        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Bulk upload Shepherd PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
+        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.1 — Bulk upload + improved scoring</div>
       </div>
       <Card style={{marginBottom:24}}>
         <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Create New Audit</h2>
@@ -715,7 +1500,7 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
           <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Your Audits</h2>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {audits.map(a => (
-              <div key={a.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",borderRadius:8,border:"1px solid #E5E7EB",cursor:"pointer"}}
+              <div key={a.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",borderRadius:8,border:"1px solid #E5E7EB",cursor:"pointer",transition:"border-color 0.15s ease"}}
                 onMouseEnter={e=>e.currentTarget.style.borderColor="#0D9488"} onMouseLeave={e=>e.currentTarget.style.borderColor="#E5E7EB"}>
                 <div onClick={()=>onSelect(a.id)} style={{flex:1}}>
                   <div style={{fontWeight:600,color:"#1a1a1a",fontSize:15}}>{a.name}</div>
@@ -730,6 +1515,10 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
       <div style={{marginTop:32,padding:20,background:"#F0FDFA",borderRadius:12,border:"1px solid #99F6E4"}}>
         <div style={{fontSize:13,color:"#0F766E",fontWeight:600,marginBottom:6}}>🔒 Privacy</div>
         <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>All PDF processing and data storage happens locally in your browser. Nothing is transmitted externally.</div>
+      </div>
+      <div style={{marginTop:12,padding:20,background:"#EFF6FF",borderRadius:12,border:"1px solid #BFDBFE"}}>
+        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.1)</div>
+        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>Bulk upload for multiple records at once with batch review. Unscored criteria count against compliance. Expanded Shepherd record pattern matching. Overdue reminder detection.</div>
       </div>
     </div>
   );

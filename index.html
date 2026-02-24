@@ -92,7 +92,7 @@ async function extractPDFText(file) {
 // ==========================================
 function parsePatientRecord(text) {
   const result = {
-    demographics: { species: null, ageYears: 0, ageMonths: 0, sex: null, intact: null, code: '', dvm: '', visitType: 'wellness' },
+    demographics: { species: null, ageYears: 0, ageMonths: 0, sex: null, intact: null, name: '', code: '', breed: '', ownerName: '', dvm: '', visitType: 'wellness' },
     statuses: {},
     confidence: {},
     findings: [],
@@ -175,6 +175,45 @@ function parsePatientRecord(text) {
   // ---- PATIENT CODE ----
   const pidMatch = t.match(/Patient\s*ID:\s*([A-Z0-9]+)/i);
   if (pidMatch) { result.demographics.code = pidMatch[1]; }
+
+  // ---- PATIENT NAME ----
+  // Shepherd format: patient name appears on its own line before "Species:"
+  const nameMatch = t.match(/\n\s*([A-Z][a-zA-Z'\- ]{1,30})\s*\n\s*Species:/);
+  if (nameMatch) {
+    result.demographics.name = nameMatch[1].trim();
+    result.confidence.name = 'high';
+  } else {
+    // Fallback: look for name in "Patient History: X-year-old ... named Y" or similar
+    const namedMatch = t.match(/(?:named|patient(?:\s*name)?(?:\s*is)?:?)\s+([A-Z][a-zA-Z'\-]+)/i);
+    if (namedMatch) { result.demographics.name = namedMatch[1].trim(); result.confidence.name = 'medium'; }
+  }
+
+  // ---- BREED ----
+  const breedMatch = t.match(/Breed:\s*(.+?)(?:\s{2,}|\n|Last\s*Weight|Sex:|Color:)/i);
+  if (breedMatch) {
+    result.demographics.breed = breedMatch[1].trim();
+    result.confidence.breed = 'high';
+  }
+
+  // ---- OWNER NAME ----
+  // Shepherd: owner block appears between clinic info and pet info
+  // Owner name is on a line by itself, followed by an address line with street number
+  const ownerMatch = t.match(/(?:healthcare needs!|\.com)\s*\n?\s*([A-Z][a-zA-Z'\- ]+(?:\s+[A-Z][a-zA-Z'\-]+)+)\s*\n\s*\d+/);
+  if (ownerMatch) {
+    result.demographics.ownerName = ownerMatch[1].trim();
+    result.confidence.ownerName = 'high';
+  } else {
+    // Fallback: look for "Client: Name" or owner line before an address pattern
+    const ownerFallback = t.match(/(?:Client|Owner)(?:\s*Name)?:\s*([A-Z][a-zA-Z'\- ]+(?:\s+[A-Z][a-zA-Z'\-]+)+)/i);
+    if (ownerFallback) { result.demographics.ownerName = ownerFallback[1].trim(); result.confidence.ownerName = 'medium'; }
+  }
+
+  // ---- NAME FROM SOAP (fallback for name) ----
+  // "Copper presents for annual wellness" or "Chloe presents for senior wellness"
+  if (!result.demographics.name) {
+    const presentsMatch = t.match(/(?:Presenting Complaint:\s*)(\w+)\s+presents?\s+for/i);
+    if (presentsMatch) { result.demographics.name = presentsMatch[1]; result.confidence.name = 'medium'; }
+  }
 
   // ==========================================
   // VACCINE DETECTION
@@ -675,11 +714,11 @@ function saveData(data) { localStorage.setItem("h3-audit-v3", JSON.stringify(dat
 
 function exportCSV(audit) {
   if (!audit?.patients?.length) return;
-  const headers = ["Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score Label","Compliance %","Items Scored","Items Unscored","Total Applicable",...CRITERIA.map(c=>c.label),"Gaps","Notes"];
+  const headers = ["Patient Name","Breed","Owner Name","Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score Label","Compliance %","Items Scored","Items Unscored","Total Applicable",...CRITERIA.map(c=>c.label),"Gaps","Notes"];
   const rows = audit.patients.map((p) => {
     const criteria = getApplicableCriteria(p.species, p.ageYears, p.ageMonths, p.intact);
     const score = calculateScore(p.statuses||{}, criteria);
-    return [p.code, p.species, (p.ageYears||0)+"y "+(p.ageMonths||0)+"m", p.sex, p.intact?"Yes":"No",
+    return [p.name||"", p.breed||"", p.ownerName||"", p.code, p.species, (p.ageYears||0)+"y "+(p.ageMonths||0)+"m", p.sex, p.intact?"Yes":"No",
       p.visitType, p.dvm||"", score.label, score.rate!==null?(score.rate*100).toFixed(0)+"%":"N/A",
       score.scored, score.unscored, score.total,
       ...CRITERIA.map(c=>(p.statuses||{})[c.id]||"(unscored)"),
@@ -796,7 +835,12 @@ function BulkUploadView({ onSaveAll, onCancel }) {
           allResults.push({ file: file.name, error: 'Could not extract text — may be image-based', parsed: null, include: false });
         } else {
           const parsed = parsePatientRecord(text);
-          parsed.demographics.code = file.name.replace(/\.pdf$/i, '').replace(/^Medical_Record__/, '').replace(/__\d+$/, '').substring(0, 40);
+          // Extract name from filename if parser didn't find one (Shepherd format: Medical_Record__Name__date.pdf)
+          const fileNameParts = file.name.replace(/\.pdf$/i, '').match(/^Medical_Record__(.+?)__\d+$/);
+          if (fileNameParts && !parsed.demographics.name) {
+            parsed.demographics.name = fileNameParts[1].replace(/_/g, ' ');
+          }
+          parsed.demographics.code = parsed.demographics.code || file.name.replace(/\.pdf$/i, '').replace(/^Medical_Record__/, '').replace(/__\d+$/, '').substring(0, 40);
           const criteria = getApplicableCriteria(parsed.demographics.species, parsed.demographics.ageYears, parsed.demographics.ageMonths, parsed.demographics.intact);
           const score = calculateScore(parsed.statuses || {}, criteria);
           allResults.push({
@@ -808,7 +852,10 @@ function BulkUploadView({ onSaveAll, onCancel }) {
             include: true,
             form: {
               id: generateId(),
+              name: parsed.demographics.name || '',
               code: parsed.demographics.code,
+              breed: parsed.demographics.breed || '',
+              ownerName: parsed.demographics.ownerName || '',
               species: parsed.demographics.species || 'canine',
               ageYears: parsed.demographics.ageYears || 0,
               ageMonths: parsed.demographics.ageMonths || 0,
@@ -975,10 +1022,10 @@ function BulkUploadView({ onSaveAll, onCancel }) {
                   )}
                   <span style={{fontSize:18}}>{r.error ? '⚠️' : r.form?.species==="feline"?"🐈":"🐕"}</span>
                   <div>
-                    <div style={{fontSize:14,fontWeight:600,color:r.error?"#991B1B":"#1a1a1a"}}>{r.form?.code || r.file}</div>
+                    <div style={{fontSize:14,fontWeight:600,color:r.error?"#991B1B":"#1a1a1a"}}>{r.form?.name || r.form?.code || r.file}{r.form?.breed ? <span style={{fontWeight:400,color:"#6B7280"}}> — {r.form.breed}</span> : ""}</div>
                     {r.parsed && (
                       <div style={{fontSize:12,color:"#9CA3AF"}}>
-                        {r.form?.species==="canine"?"Canine":"Feline"}, {r.form?.ageYears}y {r.form?.ageMonths}m · {r.form?.dvm||"No DVM"} · {r.parsed?.findings?.length||0} items detected
+                        {r.form?.species==="canine"?"Canine":"Feline"}, {r.form?.ageYears}y {r.form?.ageMonths}m · {r.form?.dvm||"No DVM"}{r.form?.ownerName ? " · O: "+r.form.ownerName : ""} · {r.parsed?.findings?.length||0} detected
                         {r.score?.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {r.score.unscored} unscored</span>}
                       </div>
                     )}
@@ -1077,7 +1124,11 @@ function PDFUploadView({ onParsed, onCancel }) {
       const text = await extractPDFText(file);
       if (!text || text.trim().length < 50) { setError('Could not extract text from this PDF. The file may be image-based or scanned. Try a Shepherd-exported PDF with selectable text.'); setParsing(false); return; }
       const parsed = parsePatientRecord(text);
-      parsed.demographics.code = file.name.replace(/\.pdf$/i, '').substring(0, 40);
+      const fileNameParts = file.name.replace(/\.pdf$/i, '').match(/^Medical_Record__(.+?)__\d+$/);
+      if (fileNameParts && !parsed.demographics.name) {
+        parsed.demographics.name = fileNameParts[1].replace(/_/g, ' ');
+      }
+      parsed.demographics.code = parsed.demographics.code || file.name.replace(/\.pdf$/i, '').substring(0, 40);
       onParsed(parsed);
     } catch (e) { setError('Error reading PDF: ' + e.message); }
     setParsing(false);
@@ -1111,7 +1162,9 @@ function PDFUploadView({ onParsed, onCancel }) {
 // Review Parsed Data
 function ParsedReviewView({ parsed, onSave, onCancel }) {
   const [form, setForm] = useState(() => ({
-    id: generateId(), code: parsed.demographics.code || '', species: parsed.demographics.species || 'canine',
+    id: generateId(), name: parsed.demographics.name || '', code: parsed.demographics.code || '',
+    breed: parsed.demographics.breed || '', ownerName: parsed.demographics.ownerName || '',
+    species: parsed.demographics.species || 'canine',
     ageYears: parsed.demographics.ageYears || 0, ageMonths: parsed.demographics.ageMonths || 0,
     sex: parsed.demographics.sex || 'female', intact: parsed.demographics.intact ?? false,
     visitType: parsed.demographics.visitType || 'wellness', dvm: parsed.demographics.dvm || '',
@@ -1165,7 +1218,12 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
       <Card style={{marginBottom:16}}>
         <h3 style={{margin:"0 0 12px 0",fontSize:14,fontWeight:600,color:"#374151"}}>Patient Demographics</h3>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
-          <div><label style={labelStyle}>Patient Code</label><input value={form.code} onChange={e=>setField("code",e.target.value)} style={inputStyle}/></div>
+          <div><label style={labelStyle}>Patient Name</label><input value={form.name} onChange={e=>setField("name",e.target.value)} placeholder="e.g., Copper" style={inputStyle}/></div>
+          <div><label style={labelStyle}>Breed</label><input value={form.breed} onChange={e=>setField("breed",e.target.value)} style={inputStyle}/></div>
+          <div><label style={labelStyle}>Owner Name</label><input value={form.ownerName} onChange={e=>setField("ownerName",e.target.value)} style={inputStyle}/></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginTop:16}}>
+          <div><label style={labelStyle}>Patient Code / ID</label><input value={form.code} onChange={e=>setField("code",e.target.value)} style={inputStyle}/></div>
           <div><label style={labelStyle}>Species</label>
             <div style={{display:"flex",gap:6}}>
               <button style={radioStyle(form.species==="canine")} onClick={()=>setField("species","canine")}>🐕 Canine</button>
@@ -1232,7 +1290,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
 
 // Manual Patient Form
 function PatientForm({ patient, onSave, onCancel }) {
-  const [form, setForm] = useState(patient || { id:generateId(), code:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"", gaps:[] });
+  const [form, setForm] = useState(patient || { id:generateId(), name:"", code:"", breed:"", ownerName:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"", gaps:[] });
   const criteria = useMemo(() => getApplicableCriteria(form.species, form.ageYears, form.ageMonths, form.intact), [form]);
   const setField = (f, v) => setForm(p => ({ ...p, [f]: v }));
   const setStatus = (cid, s) => setForm(p => ({ ...p, statuses: { ...p.statuses, [cid]: p.statuses[cid]===s?undefined:s } }));
@@ -1258,7 +1316,12 @@ function PatientForm({ patient, onSave, onCancel }) {
       </div>
       <Card style={{marginBottom:16}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
-          <div><label style={labelStyle}>Patient Code</label><input value={form.code} onChange={e=>setField("code",e.target.value)} placeholder="P-001" style={inputStyle}/></div>
+          <div><label style={labelStyle}>Patient Name</label><input value={form.name} onChange={e=>setField("name",e.target.value)} placeholder="e.g., Copper" style={inputStyle}/></div>
+          <div><label style={labelStyle}>Breed</label><input value={form.breed} onChange={e=>setField("breed",e.target.value)} style={inputStyle}/></div>
+          <div><label style={labelStyle}>Owner Name</label><input value={form.ownerName} onChange={e=>setField("ownerName",e.target.value)} style={inputStyle}/></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginTop:16}}>
+          <div><label style={labelStyle}>Patient Code / ID</label><input value={form.code} onChange={e=>setField("code",e.target.value)} placeholder="P-001" style={inputStyle}/></div>
           <div><label style={labelStyle}>Species</label><div style={{display:"flex",gap:6}}>
             <button style={radioStyle(form.species==="canine")} onClick={()=>setField("species","canine")}>🐕 Canine</button>
             <button style={radioStyle(form.species==="feline")} onClick={()=>setField("species","feline")}>🐈 Feline</button></div></div>
@@ -1487,7 +1550,8 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
                       <div style={{display:"flex",alignItems:"center",gap:12}}>
                         <span style={{fontSize:20}}>{p.species==="canine"?"🐕":"🐈"}</span>
                         <div>
-                          <div style={{fontSize:14,fontWeight:600,color:"#1a1a1a"}}>{p.code||"Unnamed"} — {p.species==="canine"?"Canine":"Feline"}, {p.ageYears}y {p.ageMonths}m</div>
+                          <div style={{fontSize:14,fontWeight:600,color:"#1a1a1a"}}>{p.name||p.code||"Unnamed"}{p.breed ? <span style={{fontWeight:400,color:"#6B7280"}}> — {p.breed}</span> : ""}</div>
+                          <div style={{fontSize:12,color:"#9CA3AF"}}>{p.species==="canine"?"Canine":"Feline"}, {p.ageYears}y {p.ageMonths}m{p.ownerName ? " · O: "+p.ownerName : ""}{p.code ? " · ID: "+p.code : ""}</div>
                           <div style={{fontSize:12,color:"#9CA3AF"}}>{p.visitType} · {p.dvm||"No DVM"} · {score.compliant}/{score.total} compliant
                             {score.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {score.unscored} unscored</span>}
                           </div>
@@ -1519,7 +1583,7 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
         <div style={{fontSize:48,marginBottom:12}}>🩺</div>
         <h1 style={{fontSize:28,fontWeight:700,color:"#1a1a1a"}}>H3 Preventative Care Audit Tool</h1>
         <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Upload Shepherd ZIP exports or individual PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
-        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.2 — ZIP upload + bulk processing</div>
+        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.3 — Patient names + ZIP upload</div>
       </div>
       <Card style={{marginBottom:24}}>
         <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Create New Audit</h2>
@@ -1553,8 +1617,8 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
         <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>All PDF processing and data storage happens locally in your browser. Nothing is transmitted externally.</div>
       </div>
       <div style={{marginTop:12,padding:20,background:"#EFF6FF",borderRadius:12,border:"1px solid #BFDBFE"}}>
-        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.2)</div>
-        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>ZIP folder upload support for Shepherd exports. Bulk upload for multiple records with batch review. Unscored criteria count against compliance. Expanded Shepherd record pattern matching. Overdue reminder detection.</div>
+        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.3)</div>
+        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>Patient name, breed, and owner auto-extracted from Shepherd records for easy PIMS cross-referencing. ZIP folder upload support. Bulk upload with batch review. Unscored criteria count against compliance. Expanded Shepherd record pattern matching. Overdue reminder detection.</div>
       </div>
     </div>
   );

@@ -9,7 +9,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'DM Sans', sans-serif; background: #F7F6F3; min-height: 100vh; }
@@ -92,7 +91,7 @@ async function extractPDFText(file) {
 // ==========================================
 function parsePatientRecord(text) {
   const result = {
-    demographics: { species: null, ageYears: 0, ageMonths: 0, sex: null, intact: null, name: '', code: '', breed: '', ownerName: '', dvm: '', visitType: 'wellness' },
+    demographics: { species: null, ageYears: 0, ageMonths: 0, sex: null, intact: null, code: '', dvm: '', visitType: 'wellness', name: '', breed: '', ownerName: '' },
     statuses: {},
     confidence: {},
     findings: [],
@@ -140,7 +139,7 @@ function parsePatientRecord(text) {
   }
 
   // ---- SEX & INTACT ----
-  // Shepherd uses Sex: MN, FS, MI, FI in header
+  // Shepherd uses Sex: MN, FS, MI, FI, M, F in header
   if (/\bSex:\s*FS\b/i.test(t) || /\b(fs|f\/s|female\s*spayed|spayed\s*female)\b/i.test(t)) {
     result.demographics.sex = 'female'; result.demographics.intact = false; result.confidence.sex = 'high';
   } else if (/\bSex:\s*MN\b/i.test(t) || /\b(mn|m\/n|male\s*neutered|neutered\s*male|castrated)\b/i.test(t)) {
@@ -149,11 +148,35 @@ function parsePatientRecord(text) {
     result.demographics.sex = 'male'; result.demographics.intact = true; result.confidence.sex = 'high';
   } else if (/\bSex:\s*FI\b/i.test(t) || /\bintact\s*female\b/i.test(t)) {
     result.demographics.sex = 'female'; result.demographics.intact = true; result.confidence.sex = 'high';
+  } else if (/\bSex:\s*M\s/i.test(t) || /\bSex:\s*M$/im.test(t)) {
+    // Bare "Sex: M" (no N or I suffix) = intact male
+    result.demographics.sex = 'male'; result.demographics.intact = true; result.confidence.sex = 'high';
+  } else if (/\bSex:\s*F\s/i.test(t) || /\bSex:\s*F$/im.test(t)) {
+    // Bare "Sex: F" (no S or I suffix) = intact female
+    result.demographics.sex = 'female'; result.demographics.intact = true; result.confidence.sex = 'high';
   }
   if (result.demographics.sex === null && /\bfemale\b/i.test(t)) { result.demographics.sex = 'female'; }
   if (result.demographics.sex === null && /\bmale\b/i.test(t)) { result.demographics.sex = 'male'; }
   if (result.demographics.intact === null && /\b(spayed|neutered|castrated|altered)\b/i.test(t)) { result.demographics.intact = false; }
   if (result.demographics.intact === null && /\bintact\b/i.test(t)) { result.demographics.intact = true; }
+
+  // ---- PATIENT NAME ----
+  const nameMatch = t.match(/^\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*\n?\s*Species:/m);
+  if (nameMatch) { result.demographics.name = nameMatch[1].trim(); result.confidence.name = 'high'; }
+  // Fallback: from filename
+  if (!result.demographics.name) {
+    const fnMatch = (result.demographics.code || '').match(/Medical_Record__([A-Za-z]+)__/);
+    if (fnMatch) { result.demographics.name = fnMatch[1]; result.confidence.name = 'medium'; }
+  }
+
+  // ---- BREED ----
+  const breedMatch = t.match(/Breed:\s*([^\n]+)/i);
+  if (breedMatch) { result.demographics.breed = breedMatch[1].trim(); result.confidence.breed = 'high'; }
+
+  // ---- OWNER NAME ----
+  // Shepherd format: Owner name is on its own line above the address
+  const ownerMatch = t.match(/([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*\n?\s*\d+\s+(?:N|S|E|W|North|South|East|West)/m);
+  if (ownerMatch) { result.demographics.ownerName = ownerMatch[1].trim(); result.confidence.ownerName = 'high'; }
 
   // ---- DVM ----
   // Shepherd format: "Dr. FirstName LastName" or "Created by Dr. X"
@@ -161,59 +184,46 @@ function parsePatientRecord(text) {
   if (dvmMatch) { result.demographics.dvm = 'Dr. ' + dvmMatch[1]; }
 
   // ---- VISIT TYPE ----
-  if (/\bsenior\s*wellness\b/i.test(t)) { result.demographics.visitType = 'wellness'; }
-  else if (/(?:sick|illness|emergency|vomit|diarrhea|lethargy|limp|cough)/i.test(t) && !/(?:look\s*out\s*for|monitor|contact.*if)/i.test(t)) {
-    // Only mark sick if the sick keywords are in the complaint, not in discharge instructions
-    const complaintSection = t.match(/(?:Initial Complaint|Presenting Complaint|History)[\s\S]{0,500}/i);
-    if (complaintSection && /(?:sick|illness|vomit|diarrhea|lethargy|limp|cough)/i.test(complaintSection[0])) {
-      result.demographics.visitType = 'sick';
+  // First check SOAP title (most reliable in Shepherd)
+  const soapTitleMatch = t.match(/SOAP\s+\d{2}\/\d{2}\/\d{4}\s*-\s*([^\n]+)/i);
+  const soapTitle = soapTitleMatch ? soapTitleMatch[1].trim().toLowerCase() : '';
+  
+  // Check for service history section to determine GP vs UC
+  const isUCConsult = /Health\s*Concern\s*Consultation[\s\-]*GP/i.test(t);
+  const isWellnessConsult = /Wellness\s*(?:Comprehensive\s*)?Consultation[\s\-]*GP/i.test(t);
+  
+  // UC/sick visit indicators in SOAP title
+  const ucTitleKeywords = /(?:ear\s*infection|otitis|laceration|wound|vomit|diarrhea|limp|cough|abscess|bite|sting|foreign\s*body|poison|toxicity|seizure|collapse|bloat|GDV|dyspnea|dysuria|hematuria|mass\s*removal|lump|emergency|urgent|sick|ADR)/i;
+  
+  // Wellness indicators in SOAP title  
+  const wellnessTitleKeywords = /(?:wellness|annual|new\s*puppy|new\s*kitten|puppy\s*(?:vx|exam|vaccine)|kitten\s*(?:vx|exam|vaccine)|establishing\s*care|well\s*(?:pet|check)|preventative|dental(?:\s*(?:cleaning|procedure|prophy))?)/i;
+  
+  if (wellnessTitleKeywords.test(soapTitle) || isWellnessConsult) {
+    result.demographics.visitType = 'wellness';
+  } else if (ucTitleKeywords.test(soapTitle) || isUCConsult) {
+    result.demographics.visitType = 'uc';
+    result.findings.push('UC/Sick visit detected — limited preventative care audit');
+  } else if (/(?:recheck|re-check|follow\s*up|recheck|suture\s*removal)/i.test(soapTitle)) {
+    result.demographics.visitType = 'recheck';
+  } else if (/\bsenior\s*wellness\b/i.test(t)) {
+    result.demographics.visitType = 'wellness';
+  } else {
+    // Fallback: check initial complaint section
+    const complaintSection = t.match(/(?:Initial\s*Complaint|Presenting\s*Complaint)[\s\S]{0,500}/i);
+    if (complaintSection) {
+      const complaint = complaintSection[0].toLowerCase();
+      if (/(?:wellness|vaccine|vx|annual|puppy\s*exam|kitten\s*exam|establishing)/i.test(complaint)) {
+        result.demographics.visitType = 'wellness';
+      } else if (/(?:ear\s*infection|vomit|diarrhea|limp|cough|not\s*eating|lethargy|blood\s*in|discharge|swelling|pain|injury)/i.test(complaint)) {
+        result.demographics.visitType = 'uc';
+        result.findings.push('UC/Sick visit detected from complaint — limited preventative care audit');
+      }
     }
   }
-  else if (/(?:recheck|re-check|follow\s*up)/i.test(t)) { result.demographics.visitType = 'recheck'; }
-  else if (/(?:urgent|uc\s*exam)/i.test(t)) { result.demographics.visitType = 'urgent'; }
 
   // ---- PATIENT CODE ----
   const pidMatch = t.match(/Patient\s*ID:\s*([A-Z0-9]+)/i);
   if (pidMatch) { result.demographics.code = pidMatch[1]; }
-
-  // ---- PATIENT NAME ----
-  // Shepherd format: patient name appears on its own line before "Species:"
-  const nameMatch = t.match(/\n\s*([A-Z][a-zA-Z'\- ]{1,30})\s*\n\s*Species:/);
-  if (nameMatch) {
-    result.demographics.name = nameMatch[1].trim();
-    result.confidence.name = 'high';
-  } else {
-    // Fallback: look for name in "Patient History: X-year-old ... named Y" or similar
-    const namedMatch = t.match(/(?:named|patient(?:\s*name)?(?:\s*is)?:?)\s+([A-Z][a-zA-Z'\-]+)/i);
-    if (namedMatch) { result.demographics.name = namedMatch[1].trim(); result.confidence.name = 'medium'; }
-  }
-
-  // ---- BREED ----
-  const breedMatch = t.match(/Breed:\s*(.+?)(?:\s{2,}|\n|Last\s*Weight|Sex:|Color:)/i);
-  if (breedMatch) {
-    result.demographics.breed = breedMatch[1].trim();
-    result.confidence.breed = 'high';
-  }
-
-  // ---- OWNER NAME ----
-  // Shepherd: owner block appears between clinic info and pet info
-  // Owner name is on a line by itself, followed by an address line with street number
-  const ownerMatch = t.match(/(?:healthcare needs!|\.com)\s*\n?\s*([A-Z][a-zA-Z'\- ]+(?:\s+[A-Z][a-zA-Z'\-]+)+)\s*\n\s*\d+/);
-  if (ownerMatch) {
-    result.demographics.ownerName = ownerMatch[1].trim();
-    result.confidence.ownerName = 'high';
-  } else {
-    // Fallback: look for "Client: Name" or owner line before an address pattern
-    const ownerFallback = t.match(/(?:Client|Owner)(?:\s*Name)?:\s*([A-Z][a-zA-Z'\- ]+(?:\s+[A-Z][a-zA-Z'\-]+)+)/i);
-    if (ownerFallback) { result.demographics.ownerName = ownerFallback[1].trim(); result.confidence.ownerName = 'medium'; }
-  }
-
-  // ---- NAME FROM SOAP (fallback for name) ----
-  // "Copper presents for annual wellness" or "Chloe presents for senior wellness"
-  if (!result.demographics.name) {
-    const presentsMatch = t.match(/(?:Presenting Complaint:\s*)(\w+)\s+presents?\s+for/i);
-    if (presentsMatch) { result.demographics.name = presentsMatch[1]; result.confidence.name = 'medium'; }
-  }
 
   // ==========================================
   // VACCINE DETECTION
@@ -243,9 +253,16 @@ function parsePatientRecord(text) {
                      /(?:administered|given).*(?:DAPP|DHPP|DA2PP|distemper)/i.test(t) ||
                      /(?:DAPP|DA2PP)\s*(?:3\s*year|\d\s*year|[\+])\s*.*Qty:\s*1/i.test(t);
   const dappInVaccTable = /(?:DAPP|DA2PP|DHPP)\s*(?:3\s*year|\+\s*L|\-\s*\d)/i.test(t);
+  
+  // Detect if DAPP+L (includes Lepto) vs DAPP-only
+  const dappIncludesLepto = /(?:DAPP|DA2PP)\s*\+\s*L/i.test(t) || /DAPP\s*3\s*year\s*\+\s*L\s*1\s*year/i.test(t) || /DAPPL/i.test(t);
 
   if (dappGiven || dappInVaccTable) {
     result.statuses.dhpp = 'met'; result.confidence.dhpp = 'high'; result.findings.push('DHPP/DAPP vaccine addressed');
+    // If DAPP+L was given, also credit Lepto
+    if (dappIncludesLepto && !result.statuses.lepto) {
+      result.statuses.lepto = 'met'; result.confidence.lepto = 'high'; result.findings.push('Lepto included with DAPP+L vaccine');
+    }
   } else if (/(?:DAPP|DHPP|DA2PP|distemper).*(?:decline|refused)/i.test(t)) {
     result.statuses.dhpp = 'declined'; result.confidence.dhpp = 'high'; result.findings.push('DHPP/DAPP declined');
   } else if (/(?:DAPP|DHPP|DA2PP|distemper).*(?:due|overdue|recommend)/i.test(t)) {
@@ -332,20 +349,33 @@ function parsePatientRecord(text) {
   const ppProducts = /(?:simparica\s*trio|revolution\s*plus|bravecto\s*plus|nexgard|heartgard|interceptor|sentinel|credelio|advantage\s*multi)/i;
   const ppDispensed = new RegExp(ppProducts.source + '.*(?:dispensed|started|prescribed|administered|purchased|continued|supply|dose|Qty|Rx)', 'i').test(t) ||
                       new RegExp('(?:dispensed|started|prescribed|administered|purchased).*' + ppProducts.source, 'i').test(t) ||
-                      /Simparica\s*Trio.*(?:single\s*dose|6[\s-]*(?:month|mo|pk)|12[\s-]*(?:month|mo))/i.test(t);
+                      /Simparica\s*Trio.*(?:single\s*dose|6[\s-]*(?:month|mo|pk)|12[\s-]*(?:month|mo))/i.test(t) ||
+                      /Client\s*elected\s*to\s*proceed.*(?:simparica|prevention|parasite)/i.test(t) ||
+                      /(?:simparica|prevention|parasite).*Client\s*elected\s*to\s*proceed/i.test(t) ||
+                      /Original\s*Prescription:\s*Simparica\s*Trio/i.test(t);
   const ppDeclined = /(?:simparica|revolution|bravecto|parasite\s*prev|flea.*tick.*prev|heartworm\s*prev).*(?:decline|refused|elected.*(?:not|hold\s*off))/i.test(t) ||
                      /(?:decline|refused|hold\s*off|elected\s*not).*(?:simparica|revolution|bravecto|parasite|prevention)/i.test(t) ||
-                     /Client\s*(?:declined|elected\s*to\s*hold\s*off).*(?:prevention|simparica|parasite)/i.test(t);
+                     /Client\s*(?:declined|elected\s*to\s*hold\s*off).*(?:prevention|simparica|parasite|flea)/i.test(t) ||
+                     /O\s*declined[\s\S]{0,100}(?:Simparica|prevention|flea)/i.test(t);
   const ppDiscussed = /(?:simparica|revolution|bravecto|parasite\s*prev|flea.*tick|heartworm\s*prev).*(?:recommend|discuss|offered|information)/i.test(t) ||
                       /(?:recommend|discuss|offered).*(?:simparica|revolution|bravecto|parasite|flea.*tick)/i.test(t) ||
                       /(?:flea|tick|heartworm).*(?:prevention|preventative|prev)\b/i.test(t);
+  // Detect seasonal/summer-only use (partial compliance)
+  const ppSeasonalOnly = /(?:simparica|prevention|flea.*tick).*(?:only\s*(?:during|in)\s*(?:summer|warm|spring)|seasonal|not\s*year[\s\-]*round)/i.test(t) ||
+                         /(?:summer\s*only|warm\s*months\s*only).*(?:simparica|prevention|flea)/i.test(t);
 
   if (ppDispensed) {
-    result.statuses.parasite_prev = 'met'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention dispensed/prescribed');
+    // Check if it's seasonal only
+    if (ppSeasonalOnly) {
+      result.statuses.parasite_prev = 'partial'; result.confidence.parasite_prev = 'high';
+      result.findings.push('Parasite prevention used seasonally (not year-round)');
+      result.gaps.push('Parasite prevention: seasonal use detected — recommend year-round');
+    } else {
+      result.statuses.parasite_prev = 'met'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention dispensed/prescribed');
+    }
   } else if (ppDeclined) {
-    // Check if it was also discussed (partial credit for discussing even if declined)
-    result.statuses.parasite_prev = 'declined'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention discussed, client declined');
-  } else if (ppDiscussed) {
+    result.statuses.parasite_prev = 'declined'; result.confidence.parasite_prev = 'high'; result.findings.push('Parasite prevention recommended, client declined');
+  } else if (ppDiscussed || ppSeasonalOnly) {
     result.statuses.parasite_prev = 'partial'; result.confidence.parasite_prev = 'medium'; result.findings.push('Parasite prevention discussed');
   }
 
@@ -362,13 +392,24 @@ function parsePatientRecord(text) {
 
   // --- WELLNESS BLOODWORK ---
   // Shepherd abbreviations: bw, BW, bloodwork, blood panel, CBC, chemistry, comprehensive panel
-  const bwPerformed = /(?:bloodwork|blood\s*work|blood\s*panel|cbc|chemistry|comprehensive\s*panel|wellness\s*panel|bw)\b.*(?:performed|ran|completed|result|normal|wnl|submitted|sent)/i.test(t) ||
-                      /(?:performed|ran|completed|result|normal).*(?:bloodwork|blood\s*panel|cbc|chemistry|bw)\b/i.test(t);
+  // Also: Pre-Surgical Screen, KA600, Accuplex, Antech, full blood panel, Venipuncture
+  const bwPerformed = /(?:bloodwork|blood\s*work|blood\s*panel|cbc|chemistry|comprehensive\s*panel|wellness\s*panel|bw)\b.*(?:performed|ran|completed|result|normal|wnl|submitted|sent|processed)/i.test(t) ||
+                      /(?:performed|ran|completed|result|normal).*(?:bloodwork|blood\s*panel|cbc|chemistry|bw)\b/i.test(t) ||
+                      /(?:Pre[\-\s]*(?:Surgical|Anesthetic|Op)\s*Screen|Pre[\-\s]*(?:surgical|anesthetic)\s*(?:bloodwork|blood\s*panel|bw))/i.test(t) ||
+                      /(?:KA600|Accuplex|4DX\+|Antech|IDEXX|ElementHT5|DriChem)/i.test(t) ||
+                      /Venipuncture.*(?:Lab|processing|blood)/i.test(t) ||
+                      /(?:Lab|processing).*Venipuncture/i.test(t) ||
+                      /(?:full|complete)\s*blood\s*panel/i.test(t) ||
+                      /In\s*House\s*Pre[\-\s]*Surgical\s*Screen/i.test(t) ||
+                      /Bloodwork\s*(?:was|is|indicates?)\s*(?:WNL|normal|unremarkable)/i.test(t) ||
+                      /(?:Pulled|Drew|Collected)\s*(?:from|blood).*(?:cephalic|jugular|saphenous)/i.test(t) ||
+                      /(?:heartworm|hw)\s*(?:antigen|test).*(?:negative|positive|detected|not\s*detected)/i.test(t);
   const bwRecommended = /(?:bloodwork|blood\s*work|blood\s*panel|cbc|bw|annual\s*bw|wellness\s*bw)\b.*(?:recommend|offered|discussed|due|est\b)/i.test(t) ||
                         /(?:recommend|offered|est\s*for).*(?:bloodwork|blood\s*panel|bw|blood\s*work)\b/i.test(t) ||
                         /Est\s*(?:for|:).*\bbw\b/i.test(t) ||
                         /annual\s*bloodwork/i.test(t) ||
-                        /(?:offered|client\s*was\s*offered)[\s\S]{0,200}(?:bloodwork|blood\s*panel|bw)\b/i.test(t);
+                        /(?:offered|client\s*was\s*offered)[\s\S]{0,200}(?:bloodwork|blood\s*panel|bw)\b/i.test(t) ||
+                        /pre[\-\s]*anesthetic\s*bloodwork\s*(?:recommend|benefit)/i.test(t);
   const bwDeclined = /(?:bloodwork|blood\s*work|blood\s*panel|bw|annual\s*bloodwork)\b.*(?:decline|refused)/i.test(t) ||
                      /(?:decline|refused).*(?:bloodwork|blood\s*panel|bw|annual\s*bloodwork)\b/i.test(t) ||
                      /Client\s*(?:Declined|declined)[\s\S]{0,200}(?:bloodwork|blood\s*panel|bw)\b/i.test(t);
@@ -415,8 +456,11 @@ function parsePatientRecord(text) {
                          /(?:performed|submitted|sent).*\bfecal\b/i.test(t);
   const fecalRecommended = /\bfecal\b.*(?:recommend|offered|due|est\b)/i.test(t) ||
                            /(?:recommend|offered|est\s*for).*\bfecal\b/i.test(t) ||
-                           /Est\s*(?:for|:).*fecal/i.test(t);
-  const fecalDeclined = /\bfecal\b.*(?:decline|refused)/i.test(t) || /(?:decline|refused).*\bfecal\b/i.test(t);
+                           /Est\s*(?:for|:).*fecal/i.test(t) ||
+                           /O\s*(?:is\s*)?to\s*bring\s*(?:back\s*)?fecal/i.test(t);
+  const fecalDeclined = /\bfecal\b.*(?:decline|refused)/i.test(t) || /(?:decline|refused).*\bfecal\b/i.test(t) ||
+                        /Client\s*declined[\s\S]{0,150}(?:fecal|Fecal\s*parasite\s*test)/i.test(t) ||
+                        /(?:Fecal\s*parasite\s*test).*(?:offered|recommend).*(?:client\s*declined)/i.test(t);
 
   if (fecalPerformed) {
     result.statuses.fecal = 'met'; result.confidence.fecal = 'high'; result.findings.push('Fecal exam performed');
@@ -433,18 +477,40 @@ function parsePatientRecord(text) {
   // --- DENTAL GRADE ---
   // Shepherd formats: "grade 2", "Grade 2/4", "cat 1", "AVDC stage 1", "periodontal disease cat 1"
   let dentalGradeValue = null;
+  const totalAgeMonths = (result.demographics.ageYears || 0) * 12 + (result.demographics.ageMonths || 0);
+  const isPuppy = totalAgeMonths < 7; // Under 7 months = deciduous teeth
+  
   const gradePatterns = [
     /(?:grade|gr)\.?\s*(\d)\s*(?:\/\s*4)?/i,
     /(?:periodontal\s*disease|dental)\s*(?:cat(?:egory)?|stage|grade)\s*(\d)/i,
     /AVDC\s*(?:stage|grade)\s*(\d)/i,
     /(?:cat(?:egory)?|stage)\s*(\d)\s*(?:\/\s*4)?(?:\s*(?:dental|periodontal))?/i,
+    /I(?:'|')d\s*grade\s*(?:this|the\s*teeth|dental)\s*(?:a|at)?\s*(\d)\s*(?:\/\s*4|out\s*of\s*4)?/i,
   ];
   for (const p of gradePatterns) {
     const m = t.match(p);
     if (m) { dentalGradeValue = parseInt(m[1]); break; }
   }
 
-  if (dentalGradeValue !== null) {
+  // "Normal puppy dentition" = Grade 1 equivalent
+  if (dentalGradeValue === null && /normal\s*puppy\s*dentition/i.test(t)) {
+    dentalGradeValue = 1;
+    result.confidence.dental_grade = 'medium';
+    result.findings.push('Normal puppy dentition noted (equivalent to Grade 1)');
+  }
+  
+  // For puppies under 6-7 months, dental grading standard is N/A
+  if (isPuppy) {
+    if (dentalGradeValue !== null) {
+      result.statuses.dental_grade = 'met'; result.confidence.dental_grade = result.confidence.dental_grade || 'high';
+      if (!result.findings.some(f => /puppy dentition/i.test(f))) result.findings.push('Dental grade ' + dentalGradeValue + ' documented');
+    } else {
+      result.statuses.dental_grade = 'na'; result.confidence.dental_grade = 'high';
+      result.findings.push('Dental grading N/A (puppy with deciduous teeth)');
+    }
+    result.statuses.dental_est = 'na'; result.confidence.dental_est = 'high';
+    result.statuses.dental_home = 'na'; result.confidence.dental_home = 'high';
+  } else if (dentalGradeValue !== null) {
     result.statuses.dental_grade = 'met'; result.confidence.dental_grade = 'high';
     result.findings.push('Dental grade ' + dentalGradeValue + ' documented');
 
@@ -532,8 +598,11 @@ function parsePatientRecord(text) {
   // SURGICAL
   // ==========================================
   if (result.demographics.intact) {
-    const snDiscussed = /(?:spay|neuter|ovariohysterectomy|castration|OVH).*(?:estimate|recommend|discuss|offered)/i.test(t) ||
-                        /(?:estimate|recommend|discuss|offered).*(?:spay|neuter)/i.test(t);
+    const snDiscussed = /(?:spay|neuter|ovariohysterectomy|castration|OVH).*(?:estimate|recommend|discuss|offered|timing)/i.test(t) ||
+                        /(?:estimate|recommend|discuss|offered).*(?:spay|neuter)/i.test(t) ||
+                        /(?:neutering|spaying)\s*(?:timing|recommend|around|at\s*(?:approximately)?\s*\d)/i.test(t) ||
+                        /(?:Discussed|discuss)\s*(?:neutering|spaying)\s*(?:timing|recommend|around)/i.test(t) ||
+                        /Planning\s*to\s*(?:spay|neuter)/i.test(t);
     const snDeclined = /(?:spay|neuter).*(?:decline|refused)/i.test(t);
     if (snDiscussed) {
       result.statuses.spay_neuter = 'met'; result.confidence.spay_neuter = 'high'; result.findings.push('Spay/neuter discussed');
@@ -562,7 +631,12 @@ function parsePatientRecord(text) {
   // Shepherd: "Est for X", "estimate created", "estimate sent", "estimate provided"
   const estCreated = /(?:estimate|est)\s*(?:created|generated|provided|sent|given)/i.test(t) ||
                      /created.*(?:estimate|est\b)/i.test(t) ||
-                     /Est\s*(?:for|:)\s*.+/i.test(t);
+                     /Est\s*(?:for|:)\s*.+/i.test(t) ||
+                     /O\s*approved\s*(?:estimate|est\b)/i.test(t) ||
+                     /Went\s*over\s*(?:an\s*)?estimate/i.test(t) ||
+                     /\$\d{2,}[\s\-]*(?:\$\d{2,}|\d{2,})/i.test(t) ||  // Price ranges like $950-$2000
+                     /(?:estimate|est).*(?:\$\d|cost|price)/i.test(t) ||
+                     /(?:dental|cleaning).*(?:procedure|estimate).*(?:scheduled|booked)/i.test(t);
   const estInRecord = /(?:estimate|est)\s*(?:noted|documented|in\s*(?:record|chart))/i.test(t) ||
                       /(?:documented|noted).*(?:estimate|est\b)/i.test(t);
 
@@ -638,7 +712,7 @@ function parsePatientRecord(text) {
       }
     }
     if (overdueItems.length > 0) {
-      result.findings.push('⚠️ Overdue reminders detected: ' + overdueItems.length);
+      result.findings.push('⚠ï¸ Overdue reminders detected: ' + overdueItems.length);
       for (const item of overdueItems) {
         result.gaps.push('Overdue: ' + item.substring(0, 80));
         // Map overdue reminders to criteria that aren't already set
@@ -714,14 +788,16 @@ function saveData(data) { localStorage.setItem("h3-audit-v3", JSON.stringify(dat
 
 function exportCSV(audit) {
   if (!audit?.patients?.length) return;
-  const headers = ["Patient Name","Breed","Owner Name","Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score Label","Compliance %","Items Scored","Items Unscored","Total Applicable",...CRITERIA.map(c=>c.label),"Gaps","Notes"];
+  const headers = ["Patient Name","Breed","Owner","Patient Code","Species","Age","Sex","Intact","Visit Type","DVM","Score Label","Compliance %","Items Met","Items Declined","Items Not Offered","Total Applicable",...CRITERIA.map(c=>c.label),"Gaps","Notes"];
   const rows = audit.patients.map((p) => {
     const criteria = getApplicableCriteria(p.species, p.ageYears, p.ageMonths, p.intact);
     const score = calculateScore(p.statuses||{}, criteria);
-    return [p.name||"", p.breed||"", p.ownerName||"", p.code, p.species, (p.ageYears||0)+"y "+(p.ageMonths||0)+"m", p.sex, p.intact?"Yes":"No",
+    const declinedCount = criteria.filter(c => (p.statuses||{})[c.id] === 'declined').length;
+    const notOffered = score.unscored;
+    return [p.name||'', p.breed||'', p.ownerName||'', p.code, p.species, (p.ageYears||0)+"y "+(p.ageMonths||0)+"m", p.sex, p.intact?"Yes":"No",
       p.visitType, p.dvm||"", score.label, score.rate!==null?(score.rate*100).toFixed(0)+"%":"N/A",
-      score.scored, score.unscored, score.total,
-      ...CRITERIA.map(c=>(p.statuses||{})[c.id]||"(unscored)"),
+      score.compliant, declinedCount, notOffered, score.total,
+      ...CRITERIA.map(c=>(p.statuses||{})[c.id]||"(not offered)"),
       (p.gaps||[]).join("; "), p.notes||""];
   });
   const csv = [headers,...rows].map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n");
@@ -784,37 +860,8 @@ function BulkUploadView({ onSaveAll, onCancel }) {
   const [expandedId, setExpandedId] = useState(null);
   const fileRef = useRef();
 
-  const [extractingZip, setExtractingZip] = useState(false);
-
-  const handleFiles = async (fileList) => {
-    const allFiles = Array.from(fileList);
-    const pdfs = allFiles.filter(f => f.name.toLowerCase().endsWith('.pdf'));
-    const zips = allFiles.filter(f => f.name.toLowerCase().endsWith('.zip'));
-
-    if (zips.length > 0) {
-      setExtractingZip(true);
-      for (const zipFile of zips) {
-        try {
-          const zipData = await zipFile.arrayBuffer();
-          const zip = await JSZip.loadAsync(zipData);
-          const zipEntries = Object.entries(zip.files);
-          for (const [path, entry] of zipEntries) {
-            if (entry.dir) continue;
-            const fileName = path.split('/').pop();
-            if (!fileName.toLowerCase().endsWith('.pdf')) continue;
-            // Skip macOS resource fork files
-            if (path.includes('__MACOSX') || fileName.startsWith('.')) continue;
-            const blob = await entry.async('blob');
-            const extractedFile = new File([blob], fileName, { type: 'application/pdf' });
-            pdfs.push(extractedFile);
-          }
-        } catch (e) {
-          console.error('Error extracting ZIP:', e);
-        }
-      }
-      setExtractingZip(false);
-    }
-
+  const handleFiles = (fileList) => {
+    const pdfs = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'));
     if (pdfs.length === 0) return;
     setFiles(prev => [...prev, ...pdfs]);
   };
@@ -835,12 +882,7 @@ function BulkUploadView({ onSaveAll, onCancel }) {
           allResults.push({ file: file.name, error: 'Could not extract text — may be image-based', parsed: null, include: false });
         } else {
           const parsed = parsePatientRecord(text);
-          // Extract name from filename if parser didn't find one (Shepherd format: Medical_Record__Name__date.pdf)
-          const fileNameParts = file.name.replace(/\.pdf$/i, '').match(/^Medical_Record__(.+?)__\d+$/);
-          if (fileNameParts && !parsed.demographics.name) {
-            parsed.demographics.name = fileNameParts[1].replace(/_/g, ' ');
-          }
-          parsed.demographics.code = parsed.demographics.code || file.name.replace(/\.pdf$/i, '').replace(/^Medical_Record__/, '').replace(/__\d+$/, '').substring(0, 40);
+          parsed.demographics.code = file.name.replace(/\.pdf$/i, '').replace(/^Medical_Record__/, '').replace(/__\d+$/, '').substring(0, 40);
           const criteria = getApplicableCriteria(parsed.demographics.species, parsed.demographics.ageYears, parsed.demographics.ageMonths, parsed.demographics.intact);
           const score = calculateScore(parsed.statuses || {}, criteria);
           allResults.push({
@@ -852,8 +894,8 @@ function BulkUploadView({ onSaveAll, onCancel }) {
             include: true,
             form: {
               id: generateId(),
-              name: parsed.demographics.name || '',
               code: parsed.demographics.code,
+              name: parsed.demographics.name || '',
               breed: parsed.demographics.breed || '',
               ownerName: parsed.demographics.ownerName || '',
               species: parsed.demographics.species || 'canine',
@@ -907,7 +949,7 @@ function BulkUploadView({ onSaveAll, onCancel }) {
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
           <div>
             <h2 style={{ margin:0, fontSize:20, fontWeight:700, color:"#1a1a1a" }}>Bulk Upload Records</h2>
-            <div style={{ fontSize:13, color:"#9CA3AF", marginTop:4 }}>Upload Shepherd ZIP exports or individual PDFs</div>
+            <div style={{ fontSize:13, color:"#9CA3AF", marginTop:4 }}>Upload multiple Shepherd PDFs at once</div>
           </div>
           <button onClick={onCancel} style={{ padding:"8px 16px", borderRadius:8, border:"1px solid #D1D5DB", background:"#fff", color:"#6B7280", fontWeight:600, fontSize:13, cursor:"pointer" }}>Cancel</button>
         </div>
@@ -916,8 +958,8 @@ function BulkUploadView({ onSaveAll, onCancel }) {
           <div className={"drop-zone"+(dragOver?" dragover":"")}
             onDragOver={(e)=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)}
             onDrop={(e)=>{e.preventDefault();setDragOver(false);handleFiles(e.dataTransfer.files);}}
-            onClick={()=>!processing && !extractingZip && fileRef.current?.click()}>
-            <input ref={fileRef} type="file" accept=".pdf,.zip" multiple style={{display:"none"}} onChange={(e)=>{handleFiles(e.target.files);e.target.value='';}}/>
+            onClick={()=>fileRef.current?.click()}>
+            <input ref={fileRef} type="file" accept=".pdf" multiple style={{display:"none"}} onChange={(e)=>{handleFiles(e.target.files);e.target.value='';}}/>
             {processing ? (
               <div>
                 <div style={{fontSize:40,marginBottom:12}}>⏳</div>
@@ -926,17 +968,11 @@ function BulkUploadView({ onSaveAll, onCancel }) {
                   <div style={{width:"50%",height:"100%",background:"#0F766E",borderRadius:3,animation:"pulse 1.5s infinite"}}/>
                 </div>
               </div>
-            ) : extractingZip ? (
-              <div>
-                <div style={{fontSize:40,marginBottom:12}}>📦</div>
-                <div style={{fontSize:16,fontWeight:600,color:"#0F766E"}}>Extracting PDFs from ZIP...</div>
-                <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Unpacking your Shepherd export</div>
-              </div>
             ) : (
               <div>
                 <div style={{fontSize:40,marginBottom:12}}>📂</div>
-                <div style={{fontSize:16,fontWeight:600,color:"#374151"}}>Drop Shepherd PDFs or a ZIP folder here, or click to browse</div>
-                <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Supports individual PDFs and ZIP exports — all processed locally</div>
+                <div style={{fontSize:16,fontWeight:600,color:"#374151"}}>Drop multiple Shepherd PDFs here, or click to browse</div>
+                <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>Select as many files as needed — all processed locally</div>
               </div>
             )}
           </div>
@@ -959,7 +995,7 @@ function BulkUploadView({ onSaveAll, onCancel }) {
                     <span style={{fontSize:13,color:"#374151",fontWeight:500}}>{f.name}</span>
                     <span style={{fontSize:11,color:"#9CA3AF"}}>({(f.size/1024).toFixed(0)} KB)</span>
                   </div>
-                  <button onClick={()=>removeFile(i)} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:16,padding:"0 4px"}}>×</button>
+                  <button onClick={()=>removeFile(i)} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:16,padding:"0 4px"}}>Ã—</button>
                 </div>
               ))}
             </div>
@@ -1020,12 +1056,12 @@ function BulkUploadView({ onSaveAll, onCancel }) {
                         style={{width:16,height:16,accentColor:"#0F766E",cursor:"pointer"}}/>
                     </label>
                   )}
-                  <span style={{fontSize:18}}>{r.error ? '⚠️' : r.form?.species==="feline"?"🐈":"🐕"}</span>
+                  <span style={{fontSize:18}}>{r.error ? '⚠ï¸' : r.form?.species==="feline"?"🐈":"🐕"}</span>
                   <div>
-                    <div style={{fontSize:14,fontWeight:600,color:r.error?"#991B1B":"#1a1a1a"}}>{r.form?.name || r.form?.code || r.file}{r.form?.breed ? <span style={{fontWeight:400,color:"#6B7280"}}> — {r.form.breed}</span> : ""}</div>
+                    <div style={{fontSize:14,fontWeight:600,color:r.error?"#991B1B":"#1a1a1a"}}>{r.form?.code || r.file}</div>
                     {r.parsed && (
                       <div style={{fontSize:12,color:"#9CA3AF"}}>
-                        {r.form?.species==="canine"?"Canine":"Feline"}, {r.form?.ageYears}y {r.form?.ageMonths}m · {r.form?.dvm||"No DVM"}{r.form?.ownerName ? " · O: "+r.form.ownerName : ""} · {r.parsed?.findings?.length||0} detected
+                        {r.form?.species==="canine"?"Canine":"Feline"}, {r.form?.ageYears}y {r.form?.ageMonths}m · {r.form?.dvm||"No DVM"} · {r.parsed?.findings?.length||0} items detected
                         {r.score?.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {r.score.unscored} unscored</span>}
                       </div>
                     )}
@@ -1124,11 +1160,7 @@ function PDFUploadView({ onParsed, onCancel }) {
       const text = await extractPDFText(file);
       if (!text || text.trim().length < 50) { setError('Could not extract text from this PDF. The file may be image-based or scanned. Try a Shepherd-exported PDF with selectable text.'); setParsing(false); return; }
       const parsed = parsePatientRecord(text);
-      const fileNameParts = file.name.replace(/\.pdf$/i, '').match(/^Medical_Record__(.+?)__\d+$/);
-      if (fileNameParts && !parsed.demographics.name) {
-        parsed.demographics.name = fileNameParts[1].replace(/_/g, ' ');
-      }
-      parsed.demographics.code = parsed.demographics.code || file.name.replace(/\.pdf$/i, '').substring(0, 40);
+      parsed.demographics.code = file.name.replace(/\.pdf$/i, '').substring(0, 40);
       onParsed(parsed);
     } catch (e) { setError('Error reading PDF: ' + e.message); }
     setParsing(false);
@@ -1153,7 +1185,7 @@ function PDFUploadView({ onParsed, onCancel }) {
               <div style={{fontSize:13,color:"#9CA3AF",marginTop:8}}>PDF must have selectable text (not scanned/image-based)</div></div>
           )}
         </div>
-        {error && <div style={{marginTop:12,padding:"10px 14px",background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,fontSize:13,color:"#991B1B"}}>⚠️ {error}</div>}
+        {error && <div style={{marginTop:12,padding:"10px 14px",background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,fontSize:13,color:"#991B1B"}}>⚠ï¸ {error}</div>}
       </Card>
     </div>
   );
@@ -1162,8 +1194,7 @@ function PDFUploadView({ onParsed, onCancel }) {
 // Review Parsed Data
 function ParsedReviewView({ parsed, onSave, onCancel }) {
   const [form, setForm] = useState(() => ({
-    id: generateId(), name: parsed.demographics.name || '', code: parsed.demographics.code || '',
-    breed: parsed.demographics.breed || '', ownerName: parsed.demographics.ownerName || '',
+    id: generateId(), code: parsed.demographics.code || '', name: parsed.demographics.name || '', breed: parsed.demographics.breed || '', ownerName: parsed.demographics.ownerName || '',
     species: parsed.demographics.species || 'canine',
     ageYears: parsed.demographics.ageYears || 0, ageMonths: parsed.demographics.ageMonths || 0,
     sex: parsed.demographics.sex || 'female', intact: parsed.demographics.intact ?? false,
@@ -1197,7 +1228,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
       {/* Gaps Alert */}
       {parsed.gaps && parsed.gaps.length > 0 && (
         <Card style={{marginBottom:16,padding:16,background:"#FEF2F2",border:"1px solid #FECACA"}}>
-          <h3 style={{margin:"0 0 8px 0",fontSize:14,fontWeight:700,color:"#991B1B"}}>⚠️ Gaps Identified ({parsed.gaps.length})</h3>
+          <h3 style={{margin:"0 0 8px 0",fontSize:14,fontWeight:700,color:"#991B1B"}}>⚠ï¸ Gaps Identified ({parsed.gaps.length})</h3>
           <div style={{display:"flex",flexDirection:"column",gap:4}}>
             {parsed.gaps.map((g,i) => <div key={i} style={{fontSize:13,color:"#7F1D1D",padding:"3px 0"}}>• {g}</div>)}
           </div>
@@ -1217,21 +1248,25 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
 
       <Card style={{marginBottom:16}}>
         <h3 style={{margin:"0 0 12px 0",fontSize:14,fontWeight:600,color:"#374151"}}>Patient Demographics</h3>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
-          <div><label style={labelStyle}>Patient Name</label><input value={form.name} onChange={e=>setField("name",e.target.value)} placeholder="e.g., Copper" style={inputStyle}/></div>
-          <div><label style={labelStyle}>Breed</label><input value={form.breed} onChange={e=>setField("breed",e.target.value)} style={inputStyle}/></div>
-          <div><label style={labelStyle}>Owner Name</label><input value={form.ownerName} onChange={e=>setField("ownerName",e.target.value)} style={inputStyle}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:16}}>
+          <div><label style={labelStyle}>Patient Name</label><input value={form.name||''} onChange={e=>setField("name",e.target.value)} style={inputStyle} placeholder="e.g., Barry"/></div>
+          <div><label style={labelStyle}>Breed</label><input value={form.breed||''} onChange={e=>setField("breed",e.target.value)} style={inputStyle} placeholder="e.g., Mixed Breed"/></div>
+          <div><label style={labelStyle}>Owner</label><input value={form.ownerName||''} onChange={e=>setField("ownerName",e.target.value)} style={inputStyle} placeholder="e.g., Smith"/></div>
+          <div><label style={labelStyle}>Patient Code</label><input value={form.code} onChange={e=>setField("code",e.target.value)} style={inputStyle}/></div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginTop:16}}>
-          <div><label style={labelStyle}>Patient Code / ID</label><input value={form.code} onChange={e=>setField("code",e.target.value)} style={inputStyle}/></div>
           <div><label style={labelStyle}>Species</label>
             <div style={{display:"flex",gap:6}}>
-              <button style={radioStyle(form.species==="canine")} onClick={()=>setField("species","canine")}>🐕 Canine</button>
-              <button style={radioStyle(form.species==="feline")} onClick={()=>setField("species","feline")}>🐈 Feline</button>
+              <button style={radioStyle(form.species==="canine")} onClick={()=>setField("species","canine")}>Canine</button>
+              <button style={radioStyle(form.species==="feline")} onClick={()=>setField("species","feline")}>Feline</button>
             </div></div>
           <div><label style={labelStyle}>DVM</label><input value={form.dvm} onChange={e=>setField("dvm",e.target.value)} style={inputStyle}/></div>
+          <div><label style={labelStyle}>Visit Type</label>
+            <select value={form.visitType} onChange={e=>setField("visitType",e.target.value)} style={{...inputStyle,cursor:"pointer"}}>
+              <option value="wellness">Wellness / GP</option><option value="uc">Urgent Care / Sick</option><option value="recheck">Recheck</option>
+            </select></div>
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:16,marginTop:16}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:16,marginTop:16}}>
           <div><label style={labelStyle}>Years</label><input type="number" min={0} max={30} value={form.ageYears} onChange={e=>setField("ageYears",parseInt(e.target.value)||0)} style={inputStyle}/></div>
           <div><label style={labelStyle}>Months</label><input type="number" min={0} max={11} value={form.ageMonths} onChange={e=>setField("ageMonths",parseInt(e.target.value)||0)} style={inputStyle}/></div>
           <div><label style={labelStyle}>Sex</label><div style={{display:"flex",gap:6}}>
@@ -1240,12 +1275,14 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
           <div><label style={labelStyle}>Intact?</label><div style={{display:"flex",gap:6}}>
             <button style={radioStyle(form.intact===true)} onClick={()=>setField("intact",true)}>Yes</button>
             <button style={radioStyle(form.intact===false)} onClick={()=>setField("intact",false)}>No</button></div></div>
-          <div><label style={labelStyle}>Visit Type</label>
-            <select value={form.visitType} onChange={e=>setField("visitType",e.target.value)} style={{...inputStyle,cursor:"pointer"}}>
-              <option value="wellness">Wellness</option><option value="sick">Sick</option><option value="recheck">Recheck</option><option value="urgent">Urgent</option>
-            </select></div>
         </div>
       </Card>
+
+      {form.visitType === 'uc' && (
+        <div style={{marginBottom:12,padding:"12px 16px",background:"#FEF3C7",border:"1px solid #FCD34D",borderRadius:8,fontSize:13,color:"#92400E",fontWeight:500}}>
+          UC/Sick visit detected. Preventative care standards may not fully apply. If this patient has a primary DVM elsewhere, consider excluding from the audit.
+        </div>
+      )}
 
       {Object.entries(categories).map(([catName, catCriteria]) => (
         <Card key={catName} style={{marginBottom:12,padding:16}}>
@@ -1290,7 +1327,7 @@ function ParsedReviewView({ parsed, onSave, onCancel }) {
 
 // Manual Patient Form
 function PatientForm({ patient, onSave, onCancel }) {
-  const [form, setForm] = useState(patient || { id:generateId(), name:"", code:"", breed:"", ownerName:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"", gaps:[] });
+  const [form, setForm] = useState(patient || { id:generateId(), code:"", name:"", breed:"", ownerName:"", species:"canine", ageYears:0, ageMonths:0, sex:"female", intact:false, visitType:"wellness", dvm:"", statuses:{}, notes:"", gaps:[] });
   const criteria = useMemo(() => getApplicableCriteria(form.species, form.ageYears, form.ageMonths, form.intact), [form]);
   const setField = (f, v) => setForm(p => ({ ...p, [f]: v }));
   const setStatus = (cid, s) => setForm(p => ({ ...p, statuses: { ...p.statuses, [cid]: p.statuses[cid]===s?undefined:s } }));
@@ -1316,12 +1353,7 @@ function PatientForm({ patient, onSave, onCancel }) {
       </div>
       <Card style={{marginBottom:16}}>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
-          <div><label style={labelStyle}>Patient Name</label><input value={form.name} onChange={e=>setField("name",e.target.value)} placeholder="e.g., Copper" style={inputStyle}/></div>
-          <div><label style={labelStyle}>Breed</label><input value={form.breed} onChange={e=>setField("breed",e.target.value)} style={inputStyle}/></div>
-          <div><label style={labelStyle}>Owner Name</label><input value={form.ownerName} onChange={e=>setField("ownerName",e.target.value)} style={inputStyle}/></div>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginTop:16}}>
-          <div><label style={labelStyle}>Patient Code / ID</label><input value={form.code} onChange={e=>setField("code",e.target.value)} placeholder="P-001" style={inputStyle}/></div>
+          <div><label style={labelStyle}>Patient Code</label><input value={form.code} onChange={e=>setField("code",e.target.value)} placeholder="P-001" style={inputStyle}/></div>
           <div><label style={labelStyle}>Species</label><div style={{display:"flex",gap:6}}>
             <button style={radioStyle(form.species==="canine")} onClick={()=>setField("species","canine")}>🐕 Canine</button>
             <button style={radioStyle(form.species==="feline")} onClick={()=>setField("species","feline")}>🐈 Feline</button></div></div>
@@ -1338,7 +1370,7 @@ function PatientForm({ patient, onSave, onCancel }) {
             <button style={radioStyle(form.intact===false)} onClick={()=>setField("intact",false)}>No</button></div></div>
           <div><label style={labelStyle}>Visit Type</label>
             <select value={form.visitType} onChange={e=>setField("visitType",e.target.value)} style={{...inputStyle,cursor:"pointer"}}>
-              <option value="wellness">Wellness</option><option value="sick">Sick</option><option value="recheck">Recheck</option><option value="urgent">Urgent</option>
+              <option value="wellness">Wellness / GP</option><option value="uc">Urgent Care / Sick</option><option value="recheck">Recheck</option>
             </select></div>
         </div>
       </Card>
@@ -1426,7 +1458,7 @@ function Dashboard({ audit }) {
 
       {stats.totalUnscored > 0 && (
         <div style={{marginBottom:16,padding:"12px 16px",background:"#FEF3C7",border:"1px solid #FCD34D",borderRadius:8,fontSize:13,color:"#92400E",fontWeight:500}}>
-          ⚠️ <strong>{stats.totalUnscored} items across all patients are unscored</strong> — these count against compliance. Review patients to ensure all criteria are scored.
+          ⚠ï¸ <strong>{stats.totalUnscored} items across all patients are unscored</strong> — these count against compliance. Review patients to ensure all criteria are scored.
         </div>
       )}
 
@@ -1550,17 +1582,16 @@ function AuditWorkspace({ audit, onUpdate, onBack }) {
                       <div style={{display:"flex",alignItems:"center",gap:12}}>
                         <span style={{fontSize:20}}>{p.species==="canine"?"🐕":"🐈"}</span>
                         <div>
-                          <div style={{fontSize:14,fontWeight:600,color:"#1a1a1a"}}>{p.name||p.code||"Unnamed"}{p.breed ? <span style={{fontWeight:400,color:"#6B7280"}}> — {p.breed}</span> : ""}</div>
-                          <div style={{fontSize:12,color:"#9CA3AF"}}>{p.species==="canine"?"Canine":"Feline"}, {p.ageYears}y {p.ageMonths}m{p.ownerName ? " · O: "+p.ownerName : ""}{p.code ? " · ID: "+p.code : ""}</div>
+                          <div style={{fontSize:14,fontWeight:600,color:"#1a1a1a"}}>{p.name||p.code||"Unnamed"}{p.breed ? " — "+p.breed : ""}</div>
                           <div style={{fontSize:12,color:"#9CA3AF"}}>{p.visitType} · {p.dvm||"No DVM"} · {score.compliant}/{score.total} compliant
-                            {score.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {score.unscored} unscored</span>}
+                            {score.unscored>0 && <span style={{color:"#DC2626",fontWeight:600}}> · {score.unscored} not offered</span>}
                           </div>
                         </div>
                       </div>
                       <div style={{display:"flex",alignItems:"center",gap:12}}>
                         <ScoreBadge score={score.label} size="small" />
                         {score.rate!==null&&<span style={{fontSize:14,fontWeight:700,color:score.rate>=0.9?"#059669":score.rate>=0.75?"#0D9488":score.rate>=0.5?"#D97706":"#DC2626"}}>{(score.rate*100).toFixed(0)}%</span>}
-                        <button onClick={e=>{e.stopPropagation();handleDeletePatient(p.id);}} style={{background:"none",border:"none",color:"#D1D5DB",cursor:"pointer",fontSize:16}}>×</button>
+                        <button onClick={e=>{e.stopPropagation();handleDeletePatient(p.id);}} style={{background:"none",border:"none",color:"#D1D5DB",cursor:"pointer",fontSize:16}}>Ã—</button>
                       </div>
                     </div>
                   </Card>
@@ -1582,8 +1613,8 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
       <div style={{textAlign:"center",marginBottom:40}}>
         <div style={{fontSize:48,marginBottom:12}}>🩺</div>
         <h1 style={{fontSize:28,fontWeight:700,color:"#1a1a1a"}}>H3 Preventative Care Audit Tool</h1>
-        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Upload Shepherd ZIP exports or individual PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
-        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.3 — Patient names + ZIP upload</div>
+        <p style={{color:"#6B7280",marginTop:8,fontSize:15,lineHeight:1.6}}>Bulk upload Shepherd PDFs to auto-extract data, or enter manually.<br/>All processing happens locally in your browser.</p>
+        <div style={{marginTop:8,padding:"6px 14px",display:"inline-block",background:"#E0F2FE",borderRadius:20,fontSize:12,fontWeight:600,color:"#0369A1"}}>v3.1 — Bulk upload + improved scoring</div>
       </div>
       <Card style={{marginBottom:24}}>
         <h2 style={{fontSize:16,fontWeight:600,margin:"0 0 16px 0",color:"#374151"}}>Create New Audit</h2>
@@ -1606,7 +1637,7 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
                   <div style={{fontWeight:600,color:"#1a1a1a",fontSize:15}}>{a.name}</div>
                   <div style={{fontSize:12,color:"#9CA3AF",marginTop:2}}>{a.patients.length} patient{a.patients.length!==1?"s":""} · {new Date(a.createdAt).toLocaleDateString()}</div>
                 </div>
-                <button onClick={e=>{e.stopPropagation();onDelete(a.id);}} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:18}}>×</button>
+                <button onClick={e=>{e.stopPropagation();onDelete(a.id);}} style={{background:"none",border:"none",color:"#9CA3AF",cursor:"pointer",fontSize:18}}>Ã—</button>
               </div>
             ))}
           </div>
@@ -1617,8 +1648,8 @@ function AuditListView({ audits, onSelect, onCreate, onDelete }) {
         <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>All PDF processing and data storage happens locally in your browser. Nothing is transmitted externally.</div>
       </div>
       <div style={{marginTop:12,padding:20,background:"#EFF6FF",borderRadius:12,border:"1px solid #BFDBFE"}}>
-        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.3)</div>
-        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>Patient name, breed, and owner auto-extracted from Shepherd records for easy PIMS cross-referencing. ZIP folder upload support. Bulk upload with batch review. Unscored criteria count against compliance. Expanded Shepherd record pattern matching. Overdue reminder detection.</div>
+        <div style={{fontSize:13,color:"#1E40AF",fontWeight:600,marginBottom:6}}>📊 What's New (v3.1)</div>
+        <div style={{fontSize:13,color:"#374151",lineHeight:1.6}}>v3.4: UC/sick visit detection and flagging. Declined vs not-offered distinction. Puppy dental grading (N/A for deciduous teeth). Patient name/breed/owner extraction. DAPP+L auto-credits Lepto. Seasonal parasite prevention detection. Expanded decline pattern matching.</div>
       </div>
     </div>
   );
